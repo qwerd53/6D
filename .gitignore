@@ -10,4 +10,5 @@ LOFTER/
 *.pth
 *.pt
 *.ckpt
+*.md
 

@@ -472,9 +472,32 @@ class MicKeyTrainingModel(pl.LightningModule):
             loftr_loss = self.loftr_loss(match_batch)
 
         #keypoints padding + mask过滤 完全 vectorized
-        mkpts0_list = match_batch['mkpts0_f']
-        mkpts1_list = match_batch['mkpts1_f']
-        max_pts = max([len(k) for k in mkpts0_list])
+        mkpts0_f = match_batch['mkpts0_f']  # [M, 2] - 所有匹配点
+        mkpts1_f = match_batch['mkpts1_f']  # [M, 2] - 所有匹配点
+        b_ids = match_batch['b_ids']        # [M] - 每个匹配点属于哪个批次
+        
+        # 按批次分组关键点
+        mkpts0_list = []
+        mkpts1_list = []
+        for b in range(B):
+            mask = (b_ids == b)
+            mkpts0_list.append(mkpts0_f[mask].cpu().numpy())
+            mkpts1_list.append(mkpts1_f[mask].cpu().numpy())
+        
+        max_pts = max([len(k) for k in mkpts0_list]) if mkpts0_list else 0
+        if max_pts == 0:
+            # 没有找到关键点，返回虚拟结果
+            print("没有找到关键点")
+            # return {
+            #     'R_pred': torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1),
+            #     't_pred': torch.zeros(B, 3, device=device),
+            #     'mask_loss': mask_loss_all,
+            #     'mask_iou': mask_iou_mean,
+            #     'mask0_loss': mask0_loss,
+            #     'mask1_loss': mask1_loss,
+            #     'loftr_loss': loftr_loss if training else torch.tensor(0.0, device=device)
+            # }
+            
         pts0_batch = torch.zeros(B, max_pts, 2, device=device)
         pts1_batch = torch.zeros(B, max_pts, 2, device=device)
         valid_mask_batch = torch.zeros(B, max_pts, dtype=torch.bool, device=device)
