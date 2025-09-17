@@ -408,142 +408,143 @@ class MicKeyTrainingModel(pl.LightningModule):
     #         'loftr_loss': loftr_loss_mean  # 新增：LoFTR损失
     #     }
     def forward_once(self, batch, training=True):
-    """
-    前向，LoFTR + mask + 3D + Batch Kabsch
-    keypoints padding + mask过滤
-    """
-    device = batch['image0'].device
-    B, _, H, W = batch['image0'].shape
+        #"
+        #前向，LoFTR + mask + 3D + Batch Kabsch
+        # keypoints padding + mask过滤
+        # "
 
-    # Oryon 输出（logits）
-    oryon_out = self.oryon_model.forward(batch)
-    pred_mask0_logits = oryon_out['mask_a']  # [B,1,Hf,Wf]
-    pred_mask1_logits = oryon_out['mask_q']
+        device = batch['image0'].device
+        B, _, H, W = batch['image0'].shape
 
-    #  mask loss
-    mask0_loss, _, _, mask0_iou = self.mask_loss(pred_mask0_logits, batch['mask0_gt'])
-    mask1_loss, _, _, mask1_iou = self.mask_loss(pred_mask1_logits, batch['mask1_gt'])
-    mask_loss_all = mask0_loss + mask1_loss
-    mask_iou_mean = (mask0_iou + mask1_iou) / 2.
+        # Oryon 输出（logits）
+        oryon_out = self.oryon_model.forward(batch)
+        pred_mask0_logits = oryon_out['mask_a']  # [B,1,Hf,Wf]
+        pred_mask1_logits = oryon_out['mask_q']
 
-    # 3) mask概率 & resize
-    pred_mask0_prob = F.interpolate(torch.sigmoid(pred_mask0_logits), size=(H, W), mode='bilinear',
-                                    align_corners=False).squeeze(1)
-    pred_mask1_prob = F.interpolate(torch.sigmoid(pred_mask1_logits), size=(H, W), mode='bilinear',
-                                    align_corners=False).squeeze(1)
-    pred_mask0_bin = (pred_mask0_prob > self.mask_th).float()
-    pred_mask1_bin = (pred_mask1_prob > self.mask_th).float()
+        #  mask loss
+        mask0_loss, _, _, mask0_iou = self.mask_loss(pred_mask0_logits, batch['mask0_gt'])
+        mask1_loss, _, _, mask1_iou = self.mask_loss(pred_mask1_logits, batch['mask1_gt'])
+        mask_loss_all = mask0_loss + mask1_loss
+        mask_iou_mean = (mask0_iou + mask1_iou) / 2.
 
-    # 灰度图 & mask
-    img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
-    img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
+        # 3) mask概率 & resize
+        pred_mask0_prob = F.interpolate(torch.sigmoid(pred_mask0_logits), size=(H, W), mode='bilinear',
+                                        align_corners=False).squeeze(1)
+        pred_mask1_prob = F.interpolate(torch.sigmoid(pred_mask1_logits), size=(H, W), mode='bilinear',
+                                        align_corners=False).squeeze(1)
+        pred_mask0_bin = (pred_mask0_prob > self.mask_th).float()
+        pred_mask1_bin = (pred_mask1_prob > self.mask_th).float()
 
-    # LoFTR 输入 batch
-    match_batch = {
-        'image0': img0_gray,
-        'image1': img1_gray,
-        'depth0': batch['depth0'],
-        'depth1': batch['depth1'],
-        'K0': batch['K_color0'],
-        'K1': batch['K_color1'],
-        'T_0to1': batch['pose'],
-        'T_1to0': torch.inverse(batch['pose']),
-        'scale0': torch.ones(B, 2, device=device),
-        'scale1': torch.ones(B, 2, device=device),
-        'pair_names': batch['instance_id']
-    }
+        # 灰度图 & mask
+        img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
+        img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
 
-    if training:
-        # coarse supervision
-        compute_supervision_coarse(match_batch, self.cfg)
-        # LoFTR matcher 
-        self.matcher(match_batch)
-        # fine supervision
-        compute_supervision_fine(match_batch, self.cfg)
-        # LoFTR loss
-        loftr_loss = self.loftr_loss(match_batch)
+        # LoFTR 输入 batch
+        match_batch = {
+            'image0': img0_gray,
+            'image1': img1_gray,
+            'depth0': batch['depth0'],
+            'depth1': batch['depth1'],
+            'K0': batch['K_color0'],
+            'K1': batch['K_color1'],
+            'T_0to1': batch['pose'],
+            'T_1to0': torch.inverse(batch['pose']),
+            'scale0': torch.ones(B, 2, device=device),
+            'scale1': torch.ones(B, 2, device=device),
+            'pair_names': batch['instance_id']
+        }
 
-    # keypoints padding + mask过滤 完全 vectorized
-    mkpts0_f = match_batch['mkpts0_f']  # [M, 2]
-    mkpts1_f = match_batch['mkpts1_f']  # [M, 2]
-    m_bids = match_batch['m_bids']      # [M]
+        if training:
+            # coarse supervision
+            compute_supervision_coarse(match_batch, self.cfg)
+            # LoFTR matcher
+            self.matcher(match_batch)
+            # fine supervision
+            compute_supervision_fine(match_batch, self.cfg)
+            # LoFTR loss
+            loftr_loss = self.loftr_loss(match_batch)
 
-    # 按批次分组关键点
-    mkpts0_list, mkpts1_list = [], []
-    for b in range(B):
-        mask = (m_bids == b)
-        mkpts0_list.append(mkpts0_f[mask].cpu().numpy())
-        mkpts1_list.append(mkpts1_f[mask].cpu().numpy())
+        # keypoints padding + mask过滤 完全 vectorized
+        mkpts0_f = match_batch['mkpts0_f']  # [M, 2]
+        mkpts1_f = match_batch['mkpts1_f']  # [M, 2]
+        m_bids = match_batch['m_bids']      # [M]
 
-    max_pts = max([len(k) for k in mkpts0_list]) if mkpts0_list else 0
-    if max_pts == 0:
-        print("没有找到关键点")
+        # 按批次分组关键点
+        mkpts0_list, mkpts1_list = [], []
+        for b in range(B):
+            mask = (m_bids == b)
+            mkpts0_list.append(mkpts0_f[mask].cpu().numpy())
+            mkpts1_list.append(mkpts1_f[mask].cpu().numpy())
 
-    pts0_batch = torch.zeros(B, max_pts, 2, device=device)
-    pts1_batch = torch.zeros(B, max_pts, 2, device=device)
-    valid_mask_batch = torch.zeros(B, max_pts, dtype=torch.bool, device=device)
+        max_pts = max([len(k) for k in mkpts0_list]) if mkpts0_list else 0
+        if max_pts == 0:
+            print("没有找到关键点")
 
-    lengths = torch.tensor([len(k) for k in mkpts0_list], device=device)
-    for b in range(B):
-        if lengths[b] > 0:
-            pts0_batch[b, :lengths[b]] = torch.tensor(mkpts0_list[b], device=device)
-            pts1_batch[b, :lengths[b]] = torch.tensor(mkpts1_list[b], device=device)
+        pts0_batch = torch.zeros(B, max_pts, 2, device=device)
+        pts1_batch = torch.zeros(B, max_pts, 2, device=device)
+        valid_mask_batch = torch.zeros(B, max_pts, dtype=torch.bool, device=device)
 
-    # keypoints mask过滤
-    x0 = pts0_batch[..., 0].long().clamp(0, W - 1)
-    y0 = pts0_batch[..., 1].long().clamp(0, H - 1)
-    x1 = pts1_batch[..., 0].long().clamp(0, W - 1)
-    y1 = pts1_batch[..., 1].long().clamp(0, H - 1)
-    m0_vals = pred_mask0_bin[:, y0, x0]
-    m1_vals = pred_mask1_bin[:, y1, x1]
-    valid_mask_batch = (m0_vals > 0) & (m1_vals > 0)
-    arange_pts = torch.arange(max_pts, device=device)[None, :].expand(B, -1)
-    valid_mask_batch = valid_mask_batch & (arange_pts < lengths[:, None])
+        lengths = torch.tensor([len(k) for k in mkpts0_list], device=device)
+        for b in range(B):
+            if lengths[b] > 0:
+                pts0_batch[b, :lengths[b]] = torch.tensor(mkpts0_list[b], device=device)
+                pts1_batch[b, :lengths[b]] = torch.tensor(mkpts1_list[b], device=device)
 
-    # 7) 回投影到3D 完全 batch
-    depth0 = batch['depth0'].unsqueeze(1)
-    depth1 = batch['depth1'].unsqueeze(1)
-    K0_inv = torch.linalg.inv(batch['K_color0'])
-    K1_inv = torch.linalg.inv(batch['K_color1'])
+        # keypoints mask过滤
+        x0 = pts0_batch[..., 0].long().clamp(0, W - 1)
+        y0 = pts0_batch[..., 1].long().clamp(0, H - 1)
+        x1 = pts1_batch[..., 0].long().clamp(0, W - 1)
+        y1 = pts1_batch[..., 1].long().clamp(0, H - 1)
+        m0_vals = pred_mask0_bin[:, y0, x0]
+        m1_vals = pred_mask1_bin[:, y1, x1]
+        valid_mask_batch = (m0_vals > 0) & (m1_vals > 0)
+        arange_pts = torch.arange(max_pts, device=device)[None, :].expand(B, -1)
+        valid_mask_batch = valid_mask_batch & (arange_pts < lengths[:, None])
 
-    z0 = depth0[torch.arange(B)[:, None], 0, y0, x0]
-    z1 = depth1[torch.arange(B)[:, None], 0, y1, x1]
+        # 7) 回投影到3D 完全 batch
+        depth0 = batch['depth0'].unsqueeze(1)
+        depth1 = batch['depth1'].unsqueeze(1)
+        K0_inv = torch.linalg.inv(batch['K_color0'])
+        K1_inv = torch.linalg.inv(batch['K_color1'])
 
-    pts3d0 = torch.stack([x0 * z0, y0 * z0, z0], dim=-1) @ K0_inv.transpose(1, 2)
-    pts3d1 = torch.stack([x1 * z1, y1 * z1, z1], dim=-1) @ K1_inv.transpose(1, 2)
+        z0 = depth0[torch.arange(B)[:, None], 0, y0, x0]
+        z1 = depth1[torch.arange(B)[:, None], 0, y1, x1]
 
-    valid_mask_batch = valid_mask_batch.float()  # 确保是 float
-    pts3d0 = pts3d0 * valid_mask_batch.unsqueeze(-1)
-    pts3d1 = pts3d1 * valid_mask_batch.unsqueeze(-1)
+        pts3d0 = torch.stack([x0 * z0, y0 * z0, z0], dim=-1) @ K0_inv.transpose(1, 2)
+        pts3d1 = torch.stack([x1 * z1, y1 * z1, z1], dim=-1) @ K1_inv.transpose(1, 2)
 
-    num_valid = valid_mask_batch.sum(dim=1).unsqueeze(-1).clamp(min=1)  # [B, 1]
+        valid_mask_batch = valid_mask_batch.float()  # 确保是 float
+        pts3d0 = pts3d0 * valid_mask_batch.unsqueeze(-1)
+        pts3d1 = pts3d1 * valid_mask_batch.unsqueeze(-1)
 
-    # 8) batch Kabsch
-    centroid0 = pts3d0.sum(1) / num_valid  # [B, 3]
-    centroid1 = pts3d1.sum(1) / num_valid  # [B, 3]
-    A_centered = (pts3d0 - centroid0.unsqueeze(1)) * valid_mask_batch.unsqueeze(-1)
-    B_centered = (pts3d1 - centroid1.unsqueeze(1)) * valid_mask_batch.unsqueeze(-1)
+        num_valid = valid_mask_batch.sum(dim=1).unsqueeze(-1).clamp(min=1)  # [B, 1]
 
-    H = torch.einsum('bni,bnj->bij', A_centered, B_centered)  # [B,3,3]
-    U, S, Vh = torch.linalg.svd(H)
-    V = Vh.transpose(-2, -1)
-    R = V @ U.transpose(-2, -1)
-    det = torch.linalg.det(R)
-    mask_neg = det < 0
-    if mask_neg.any():
-        V[mask_neg, -1, :] *= -1
-        R[mask_neg] = V[mask_neg] @ U[mask_neg].transpose(-2, -1)
-    t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)
+        # 8) batch Kabsch
+        centroid0 = pts3d0.sum(1) / num_valid  # [B, 3]
+        centroid1 = pts3d1.sum(1) / num_valid  # [B, 3]
+        A_centered = (pts3d0 - centroid0.unsqueeze(1)) * valid_mask_batch.unsqueeze(-1)
+        B_centered = (pts3d1 - centroid1.unsqueeze(1)) * valid_mask_batch.unsqueeze(-1)
 
-    return {
-        'R_pred': R,
-        't_pred': t,
-        'mask_loss': mask_loss_all,
-        'mask_iou': mask_iou_mean,
-        'mask0_loss': mask0_loss,
-        'mask1_loss': mask1_loss,
-        'loftr_loss': loftr_loss
-    }
+        H = torch.einsum('bni,bnj->bij', A_centered, B_centered)  # [B,3,3]
+        U, S, Vh = torch.linalg.svd(H)
+        V = Vh.transpose(-2, -1)
+        R = V @ U.transpose(-2, -1)
+        det = torch.linalg.det(R)
+        mask_neg = det < 0
+        if mask_neg.any():
+            V[mask_neg, -1, :] *= -1
+            R[mask_neg] = V[mask_neg] @ U[mask_neg].transpose(-2, -1)
+        t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)
+
+        return {
+            'R_pred': R,
+            't_pred': t,
+            'mask_loss': mask_loss_all,
+            'mask_iou': mask_iou_mean,
+            'mask0_loss': mask0_loss,
+            'mask1_loss': mask1_loss,
+            'loftr_loss': loftr_loss
+        }
 
 
     # -------------------------
