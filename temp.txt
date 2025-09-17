@@ -1,0 +1,6 @@
+  File "/mnt/data/tmp1/mickey-main/lib/models/MicKey/modules/loss/loss_class.py", line 24, in __init__
+    self.oryon_loss = FeatureLoss(cfg, device='cuda' if torch.cuda.is_available() else 'cpu')
+  File "/mnt/data/tmp1/mickey-main/filesOfOryon/losses.py", line 37, in __init__
+    raise RuntimeError(f"Mask loss function {self.mask_type} not implemented.")
+RuntimeError: Mask loss function ‘dice’ not implemented.
+(mickey) tmp1@ali-3090-Tower:/mnt/data/tmp1/mickey-main$
