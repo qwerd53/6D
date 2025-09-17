@@ -474,19 +474,18 @@ class MicKeyTrainingModel(pl.LightningModule):
         #keypoints padding + mask过滤 完全 vectorized
         mkpts0_f = match_batch['mkpts0_f']  # [M, 2] - 所有匹配点
         mkpts1_f = match_batch['mkpts1_f']  # [M, 2] - 所有匹配点
-        b_ids = match_batch['b_ids']        # [M] - 每个匹配点属于哪个批次
+        m_bids = match_batch['m_bids']      # [M] - 每个匹配点属于哪个批次
         
         # 按批次分组关键点
         mkpts0_list = []
         mkpts1_list = []
         for b in range(B):
-            mask = (b_ids == b)
+            mask = (m_bids == b)
             mkpts0_list.append(mkpts0_f[mask].cpu().numpy())
             mkpts1_list.append(mkpts1_f[mask].cpu().numpy())
         
         max_pts = max([len(k) for k in mkpts0_list]) if mkpts0_list else 0
         if max_pts == 0:
-            # 没有找到关键点，返回虚拟结果
             print("没有找到关键点")
             # return {
             #     'R_pred': torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1),
