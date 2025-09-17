@@ -134,8 +134,8 @@ def custom_collate(batch, img_size=(256, 256)):
     batch_dict = {
         'image0': torch.stack(image0_list),           # [B, 3, H, W]
         'image1': torch.stack(image1_list),
-        # 'mask0': torch.stack(mask0_list),             # [B, H, W]
-        # 'mask1': torch.stack(mask1_list),
+        #'mask0': torch.stack(mask0_list),             # [B, H, W]
+        #'mask1': torch.stack(mask1_list),
         'mask0_gt': torch.stack(mask0_list),  # 添加 _gt 后缀
         'mask1_gt': torch.stack(mask1_list),
         'K_color0': torch.stack(K0_list),             # [B, 3, 3]
