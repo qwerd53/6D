@@ -213,8 +213,8 @@ class CoarseMatching(nn.Module):
             print("train_pad_num_gt_min:", self.train_pad_num_gt_min)
             print("num_matches_train:", num_matches_train)
             print("num_candidates_max:", num_candidates_max)
-            print("mask0 sum:", data['mask0'].sum())
-            print("mask1 sum:", data['mask1'].sum())
+            # print("mask0 sum:", data['mask0'].sum())
+            # print("mask1 sum:", data['mask1'].sum())
 
             assert self.train_pad_num_gt_min < num_matches_train, "min-num-gt-pad should be less than num-train-matches"
 

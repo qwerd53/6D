@@ -458,10 +458,10 @@ class MicKeyTrainingModel(pl.LightningModule):
         if training:
             #  coarse supervision
             compute_supervision_coarse(match_batch, self.cfg)
-            print("After spvs_coarse, keys:", match_batch.keys())
-            print("spv_b_ids:", match_batch.get('spv_b_ids', None))
-            print("spv_i_ids:", match_batch.get('spv_i_ids', None))
-            print("spv_j_ids:", match_batch.get('spv_j_ids', None))
+            # print("After spvs_coarse, keys:", match_batch.keys())
+            # print("spv_b_ids:", match_batch.get('spv_b_ids', None))
+            # print("spv_i_ids:", match_batch.get('spv_i_ids', None))
+            # print("spv_j_ids:", match_batch.get('spv_j_ids', None))
             # LoFTR matcher 
             self.matcher(match_batch)
 
