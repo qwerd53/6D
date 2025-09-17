@@ -534,13 +534,13 @@ class MicKeyTrainingModel(pl.LightningModule):
 
         pts3d0 = pts3d0 * valid_mask_batch.unsqueeze(-1)
         pts3d1 = pts3d1 * valid_mask_batch.unsqueeze(-1)
-        num_valid = valid_mask_batch.sum(dim=1, keepdim=True).clamp(min=1)
+        num_valid = valid_mask_batch.sum(dim=1, keepdim=True).clamp(min=1)  # [B, 1]
 
         # 8) batch Kabsch
-        centroid0 = pts3d0.sum(1) / num_valid
-        centroid1 = pts3d1.sum(1) / num_valid
-        A_centered = pts3d0 - centroid0.unsqueeze(1)
-        B_centered = pts3d1 - centroid1.unsqueeze(1)
+        centroid0 = pts3d0.sum(1) / num_valid  # [B, 3] / [B, 1] -> [B, 3]
+        centroid1 = pts3d1.sum(1) / num_valid  # [B, 3] / [B, 1] -> [B, 3]
+        A_centered = pts3d0 - centroid0.unsqueeze(1)  # [B, max_pts, 3] - [B, 1, 3]
+        B_centered = pts3d1 - centroid1.unsqueeze(1)  # [B, max_pts, 3] - [B, 1, 3]
         A_centered = A_centered * valid_mask_batch.unsqueeze(-1)
         B_centered = B_centered * valid_mask_batch.unsqueeze(-1)
 
@@ -553,7 +553,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         if mask_neg.any():
             V[mask_neg, -1, :] *= -1
             R[mask_neg] = V[mask_neg] @ U[mask_neg].transpose(-2, -1)
-        t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)
+        t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)  # [B, 3] - [B, 3] -> [B, 3]
 
         return {
             'R_pred': R,
