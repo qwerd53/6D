@@ -44,7 +44,7 @@ from yacs.config import CfgNode as CN
 #   MicKeyTrainingModel
 # =========================
 def cfg_to_dict(cfg_node):
-    """递归把 yacs CfgNode 转成 dict，并统一小写 key"""
+    """递归 yacs CfgNode 转 dict，统一小写 key"""
     from yacs.config import CfgNode
     if isinstance(cfg_node, CfgNode):
         return {k.lower(): cfg_to_dict(v) for k, v in cfg_node.items()}
@@ -57,8 +57,8 @@ def cfg_to_dict(cfg_node):
 
 class MicKeyTrainingModel(pl.LightningModule):
     """
-    - 保留 Oryon 产生 mask 的模块
-    - LoFTR 进行匹配 + 掩码过滤 + 回投影 → Kabsch 求姿态
+    - 
+    - LoFTR 匹配 + 掩码过滤 + 回投影 → Kabsch 求姿态
     - 损失：mask_loss（BCEWithLogits） + compute_pose_loss（rot_angle + trans_l1，可选tanh clipping）
     - 每半个 epoch 跑一次 ADD(S)-0.1D 评估并记录到 TensorBoard
     """
@@ -73,10 +73,10 @@ class MicKeyTrainingModel(pl.LightningModule):
         self.oryon_model = Oryon(cfg, device='cuda' if torch.cuda.is_available() else 'cpu')
 
         # ---------- LoFTR ----------
-        # 把 YACS config 转 dict 并小写 key
+        #  YACS config 转 dict 并小写 key
         _config = cfg_to_dict(cfg)
 
-        # 提取 loftr 配置
+        # 配置
         self.loftr_cfg = _config['loftr']
         print("self.loftr_cfg:",self.loftr_cfg)
         # 初始化 matcher
@@ -86,20 +86,20 @@ class MicKeyTrainingModel(pl.LightningModule):
         self.matcher = self.matcher.train().cuda()
 
         # ---------- LoFTR Loss ----------
-        self.loftr_loss = LoFTRLoss(_config)   # 这里就能找到 ['loftr']['loss']
+        self.loftr_loss = LoFTRLoss(_config)   
 
         # ---------- Mask Loss ----------
         self._mask_loss = DiceLoss(weight=torch.tensor([0.5, 0.5]))
         self.mask_th = 0.5
         self.soft_clip = True
 
-        # ---------- 训练控制 ----------
+        # ---------- 训练 ----------
         self.automatic_optimization = True
         self.multi_gpu = True
         self.validation_step_outputs = []
         self.log_interval = getattr(cfg.TRAINING, 'LOG_INTERVAL', 50)
 
-        # 半 epoch 评估控制
+        # 半 epoch 评估
         self._ran_half_eval_for_epoch = False
         self._half_epoch_batch_idx = None
 
@@ -107,7 +107,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         return self.forward_once(batch)
 
     # -------------------------
-    #   = = = 关键 Loss = = =
+    #   = = = Loss = = =
     # -------------------------
     def mask_loss(self, pred_logits: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
         '''
@@ -134,7 +134,7 @@ class MicKeyTrainingModel(pl.LightningModule):
 
     def compute_pose_loss(self, R, t, Rgt_i, tgt_i, soft_clipping=True):
         """
-        与compute_pose_loss 一致：rot_angle_loss + trans_l1_loss（可 tanh soft clipping）
+        rot_angle_loss + trans_l1_loss（可 tanh soft clipping）
         R:    [B,3,3]
         t:    [B,1,3]
         Rgt:  [B,3,3]
@@ -168,7 +168,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         return loss, R_err
 
     # -------------------------
-    #     LoFTR + 后端求姿态
+    #     LoFTR + 求姿态
     # -------------------------
     @staticmethod
     def rgb_to_gray(tensor_rgb: torch.Tensor) -> torch.Tensor:
@@ -409,18 +409,18 @@ class MicKeyTrainingModel(pl.LightningModule):
     #     }
     def forward_once(self, batch, training=True):
         """
-        完全 batch 版本前向，LoFTR + mask + 3D + Batch Kabsch
-        完全去掉 Python 循环，包括 keypoints padding + mask过滤
+        前向，LoFTR + mask + 3D + Batch Kabsch
+        keypoints padding + mask过滤
         """
         device = batch['image0'].device
         B, _, H, W = batch['image0'].shape
 
-        # 1) Oryon 输出（logits）
+        # Oryon 输出（logits）
         oryon_out = self.oryon_model.forward(batch)
         pred_mask0_logits = oryon_out['mask_a']  # [B,1,Hf,Wf]
         pred_mask1_logits = oryon_out['mask_q']
 
-        # 2) mask loss
+        #  mask loss
         mask0_loss, _, _, mask0_iou = self.mask_loss(pred_mask0_logits, batch['mask0_gt'])
         mask1_loss, _, _, mask1_iou = self.mask_loss(pred_mask1_logits, batch['mask1_gt'])
         mask_loss_all = mask0_loss + mask1_loss
@@ -434,16 +434,16 @@ class MicKeyTrainingModel(pl.LightningModule):
         pred_mask0_bin = (pred_mask0_prob > self.mask_th).float()
         pred_mask1_bin = (pred_mask1_prob > self.mask_th).float()
 
-        # 4) 灰度图 & mask
+        # 灰度图 & mask
         img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
         img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
 
-        # 5) 构建 LoFTR 输入 batch
+      # LoFTR 输入 batch
         match_batch = {
             'image0': img0_gray,
             'image1': img1_gray,
-            'mask0': F.interpolate(batch['mask0_gt'].float().unsqueeze(1), size=(60, 80), mode='nearest').squeeze(1),
-            'mask1': F.interpolate(batch['mask1_gt'].float().unsqueeze(1), size=(60, 80), mode='nearest').squeeze(1),
+            # 'mask0': F.interpolate(batch['mask0_gt'].float().unsqueeze(1), size=(60, 80), mode='nearest').squeeze(1),
+            # 'mask1': F.interpolate(batch['mask1_gt'].float().unsqueeze(1), size=(60, 80), mode='nearest').squeeze(1),
             'depth0': batch['depth0'],
             'depth1': batch['depth1'],
             'K0': batch['K_color0'],
@@ -456,22 +456,22 @@ class MicKeyTrainingModel(pl.LightningModule):
         }
 
         if training:
-            # ✅ 先生成 coarse supervision
+            #  coarse supervision
             compute_supervision_coarse(match_batch, self.cfg)
             print("After spvs_coarse, keys:", match_batch.keys())
             print("spv_b_ids:", match_batch.get('spv_b_ids', None))
             print("spv_i_ids:", match_batch.get('spv_i_ids', None))
             print("spv_j_ids:", match_batch.get('spv_j_ids', None))
-            # LoFTR matcher 前向
+            # LoFTR matcher 
             self.matcher(match_batch)
 
             # fine supervision
             compute_supervision_fine(match_batch, self.cfg)
 
-            # 计算 LoFTR loss
+            #  LoFTR loss
             loftr_loss = self.loftr_loss(match_batch)
 
-        # 6) 批量 keypoints padding + mask过滤 完全 vectorized
+        #keypoints padding + mask过滤 完全 vectorized
         mkpts0_list = match_batch['mkpts0_f']
         mkpts1_list = match_batch['mkpts1_f']
         max_pts = max([len(k) for k in mkpts0_list])
@@ -547,7 +547,7 @@ class MicKeyTrainingModel(pl.LightningModule):
     #     Lightning Hooks
     # -------------------------
     def training_step(self, batch, batch_idx):
-        # 兼容你之前的自定义 collate 字段
+        # 兼容 collate
         if 'pose' in batch and 'T_0to1' not in batch:
             batch['T_0to1'] = batch['pose']
 
@@ -564,7 +564,7 @@ class MicKeyTrainingModel(pl.LightningModule):
             out['R_pred'], out['t_pred'], R_gt, t_gt, soft_clipping=self.soft_clip
         )
 
-        # 修改：总损失现在包含LoFTR损失
+        # totalloss
         total_loss = out['mask_loss'] + pose_loss + out['loftr_loss']
 
         # ---- 日志 ----
@@ -603,12 +603,12 @@ class MicKeyTrainingModel(pl.LightningModule):
             'mask_iou': out['mask_iou'].detach(),
         }
 
-        # 保存到列表，供 epoch_end 聚合
+        # epoch_end 聚合
         if not hasattr(self, 'validation_step_outputs'):
             self.validation_step_outputs = []
         self.validation_step_outputs.append(logs)
 
-        # 可以直接 log batch 级别的 loss
+        #  batch level  loss
         for k, v in logs.items():
             self.log(f'val/{k}', v, on_step=False, on_epoch=True, sync_dist=self.multi_gpu, prog_bar=(k == 'loss'))
 
@@ -621,7 +621,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         if not hasattr(self, 'validation_step_outputs') or len(self.validation_step_outputs) == 0:
             return
 
-        # 聚合所有 batch 的指标
+        # batch 的指标
         agg = {k: torch.stack([x[k] for x in self.validation_step_outputs]).mean()
                for k in self.validation_step_outputs[0].keys()}
 
@@ -629,7 +629,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         for k, v in agg.items():
             self.log(f'val/{k}', v, on_step=False, on_epoch=True, sync_dist=self.multi_gpu, prog_bar=(k == 'loss'))
 
-        # ADD-0.1D 评估（只在 epoch 末算一次）
+        # ADD-0.1D 评估epoch 末
         add_acc = self.run_add01d_eval()
         add_acc = float(add_acc)
         if add_acc is not None:
@@ -641,9 +641,9 @@ class MicKeyTrainingModel(pl.LightningModule):
     #   Optim / Scheduler
     # -------------------------
     def configure_optimizers(self):
-        # 修改：现在优化器需要优化LoFTR的参数
+        # 
         optimizer = torch.optim.Adam(
-            self.parameters(),  # 这会包含LoFTR的参数
+            self.parameters(),  # LoFTR的参数
             lr=self.cfg.TRAINING.LR,
             weight_decay=getattr(self.cfg.TRAINING, "WEIGHT_DECAY", 0.0),
             eps=1e-6
@@ -671,7 +671,7 @@ class MicKeyTrainingModel(pl.LightningModule):
     def run_add01d_eval(self):
         """
         LoFTR 测试评估逻辑（核心计算）：
-        - 需要 val_dataloader().dataset 提供 dataset.get_obj_info(obj_id)
+        -  val_dataloader().dataset 提供 dataset.get_obj_info(obj_id)
         - 逐 batch 用 forward_once 获取 R_pred,t_pred（已是 Query 的绝对姿态）
         - 计算物体 ADD/ADD-S，并用 0.1D 判定成功
         返回：成功率（百分比），若失败返回 None
