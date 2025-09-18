@@ -210,6 +210,7 @@ class CoarseMatching(nn.Module):
             num_matches_train = int(num_candidates_max *
                                     self.train_coarse_percent)
             num_matches_pred = len(b_ids)
+
             print("train_pad_num_gt_min:", self.train_pad_num_gt_min)
             print("num_matches_train:", num_matches_train)
             print("num_candidates_max:", num_candidates_max)
