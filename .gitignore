@@ -3,7 +3,6 @@
 weights/
 backup/
 filesOfOryon/data/
-LOFTER/
 *.zip
 *.tar
 *.tar.gz
