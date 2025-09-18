@@ -82,7 +82,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         # 初始化 matcher
         self.matcher = LoFTR(config=self.loftr_cfg)
         state_dict = torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict']
-        self.matcher.load_state_dict(state_dict, strict=False)
+        #self.matcher.load_state_dict(state_dict, strict=False)
         self.matcher = self.matcher.train().cuda()
 
         # ---------- LoFTR Loss ----------
@@ -412,7 +412,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         前向，LoFTR + mask + 3D + Batch Kabsch
         keypoints padding + mask过滤
         """
-        print("self.training:", self.training, "training param:", training)
+        #print("self.training:", self.training, "training param:", training)
 
         device = batch['image0'].device
         B, _, H, W = batch['image0'].shape
@@ -447,10 +447,10 @@ class MicKeyTrainingModel(pl.LightningModule):
         img1_gray_masked = img1_gray * mask1_gt
         # LoFTR 输入 batch
         match_batch = {
-            # 'image0': img0_gray,
-            # 'image1': img1_gray,
-            'image0': img0_gray_masked,
-            'image1': img1_gray_masked,
+             'image0': img0_gray,
+             'image1': img1_gray,
+            #'image0': img0_gray_masked,
+            #'image1': img1_gray_masked,
             'depth0': batch['depth0'],
             'depth1': batch['depth1'],
             'K0': batch['K_color0'],
@@ -470,9 +470,11 @@ class MicKeyTrainingModel(pl.LightningModule):
             # fine supervision
             compute_supervision_fine(match_batch, self.cfg)
             # LoFTR loss
-            loftr_loss = self.loftr_loss(match_batch)
+            #loftr_loss = self.loftr_loss(match_batch)
+            loftr_loss_out = self.loftr_loss(match_batch)  #  dict，包含 loss / loss_scalars
+            loftr_loss = loftr_loss_out['loss']
 
-        # keypoints padding + mask过滤 完全 vectorized
+            # keypoints padding + mask过滤 完全 vectorized
         mkpts0_f = match_batch['mkpts0_f']  # [M, 2]
         mkpts1_f = match_batch['mkpts1_f']  # [M, 2]
         m_bids = match_batch['m_bids']      # [M]
@@ -488,7 +490,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         print("max_pts:",max_pts)
         if max_pts == 0:
             print("没有找到关键点")
-            exit()
+            #exit()
 
         pts0_batch = torch.zeros(B, max_pts, 2, device=device)
         pts1_batch = torch.zeros(B, max_pts, 2, device=device)

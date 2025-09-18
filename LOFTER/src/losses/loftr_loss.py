@@ -110,6 +110,9 @@ class LoFTRLoss(nn.Module):
             expec_f_gt (torch.Tensor): [M, 2] <x, y>
         """
         correct_mask = torch.linalg.norm(expec_f_gt, ord=float('inf'), dim=1) < self.correct_thr
+        # print("self.training:",self.training)
+        #
+        # print("correct_mask.sum()", correct_mask.sum())
         if correct_mask.sum() == 0:
             if self.training:  # this seldomly happen when training, since we pad prediction with gt
                 logger.warning("assign a false supervision to avoid ddp deadlock")
@@ -190,3 +193,37 @@ class LoFTRLoss(nn.Module):
 
         loss_scalars.update({'loss': loss.clone().detach().cpu()})
         data.update({"loss": loss, "loss_scalars": loss_scalars})
+        return data
+
+    # def forward(self, data):
+    #     loss_scalars = {}
+    #     c_weight = self.compute_c_weight(data)
+    #
+    #     # coarse
+    #     loss_c = self.compute_coarse_loss(
+    #         data['conf_matrix_with_bin'] if self.sparse_spvs and self.match_type == 'sinkhorn'
+    #         else data['conf_matrix'],
+    #         data['conf_matrix_gt'],
+    #         weight=c_weight)
+    #     loss = loss_c * self.loss_config['coarse_weight']
+    #     loss_scalars.update({"loss_c": loss_c.clone().detach().cpu()})
+    #     print(f"[LoFTRLoss] coarse loss: {loss_c.item():.6f}")
+    #
+    #     # fine
+    #     loss_f = self.compute_fine_loss(data['expec_f'], data['expec_f_gt'])
+    #     if loss_f is not None:
+    #         loss += loss_f * self.loss_config['fine_weight']
+    #         loss_scalars.update({"loss_f": loss_f.clone().detach().cpu()})
+    #         print(f"[LoFTRLoss] fine loss: {loss_f.item():.6f}")
+    #     else:
+    #         assert self.training is False
+    #         loss_scalars.update({'loss_f': torch.tensor(1.)})
+    #         print(f"[LoFTRLoss] fine loss: None (set to 1.0 for eval)")
+    #
+    #     print(f"[LoFTRLoss] total loss: {loss.item():.6f}")
+    #
+    #     loss_scalars.update({'loss': loss.clone().detach().cpu()})
+    #     data.update({"loss": loss, "loss_scalars": loss_scalars})
+    #     return data
+
+
