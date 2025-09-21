@@ -445,6 +445,12 @@ class MicKeyTrainingModel(pl.LightningModule):
         # 用 GT mask 过滤灰度图，非目标区域置 0
         img0_gray_masked = img0_gray * mask0_gt
         img1_gray_masked = img1_gray * mask1_gt
+        item_a_pose = batch['item_a_pose']  # 物体在anchor下的位姿
+        item_q_pose = batch['item_q_pose']  # 物体在query下的位姿
+
+        # 相机间相对位姿 (0->1 表示 anchor相机 → query相机)
+        T_0to1 = item_q_pose @ torch.inverse(item_a_pose)
+        T_1to0 = item_a_pose @ torch.inverse(item_q_pose)
         # LoFTR 输入 batch
         match_batch = {
              'image0': img0_gray,
@@ -455,8 +461,10 @@ class MicKeyTrainingModel(pl.LightningModule):
             'depth1': batch['depth1'],
             'K0': batch['K_color0'],
             'K1': batch['K_color1'],
-            'T_0to1': batch['pose'],
-            'T_1to0': torch.inverse(batch['pose']),
+            # 'T_0to1': batch['pose'],
+            # 'T_1to0': torch.inverse(batch['pose']),
+            'T_0to1': T_0to1,
+            'T_1to0': T_1to0,
             'scale0': torch.ones(B, 2, device=device),
             'scale1': torch.ones(B, 2, device=device),
             'pair_names': batch['instance_id']
@@ -473,6 +481,10 @@ class MicKeyTrainingModel(pl.LightningModule):
             #loftr_loss = self.loftr_loss(match_batch)
             loftr_loss_out = self.loftr_loss(match_batch)  #  dict，包含 loss / loss_scalars
             loftr_loss = loftr_loss_out['loss']
+        else:
+            self.matcher(match_batch)
+            # 验证时不计算LoFTR loss
+            loftr_loss = torch.tensor(0., device=device)
 
             # keypoints padding + mask过滤 完全 vectorized
         mkpts0_f = match_batch['mkpts0_f']  # [M, 2]
