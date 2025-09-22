@@ -84,9 +84,10 @@ class MicKeyTrainingModel(pl.LightningModule):
         state_dict = torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict']
         self.matcher.load_state_dict(state_dict, strict=False)
         self.matcher = self.matcher.train().cuda()
-
-        # ---------- LoFTR Loss ----------
+        self.matcher = self.matcher.eval().cuda()
+        # ---------- LoFTR Loss ----------s
         self.loftr_loss = LoFTRLoss(_config).train()
+        self.use_gt_mask=True #filter 2d keypoints
 
         # ---------- Mask Loss ----------
         self._mask_loss = DiceLoss(weight=torch.tensor([0.5, 0.5]))
@@ -435,7 +436,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         pred_mask1_bin = (pred_mask1_prob > self.mask_th).float()
 
         # 灰度图 & mask
-        img0_gray = self.rgb_to_gray(batch['image0'])# * pred_mask0_bin.unsqueeze(1)
+        img0_gray = self.rgb_to_gray(batch['image0']) #* pred_mask0_bin.unsqueeze(1)
         img1_gray = self.rgb_to_gray(batch['image1']) #* pred_mask1_bin.unsqueeze(1)
 
         # GT mask，转成 float 并加上 channel 维度以便广播
@@ -453,8 +454,8 @@ class MicKeyTrainingModel(pl.LightningModule):
         T_1to0 = item_a_pose @ torch.inverse(item_q_pose)
         # LoFTR 输入 batch
         match_batch = {
-             # 'image0': img0_gray,
-             # 'image1': img1_gray,
+             #'image0': img0_gray,
+             #'image1': img1_gray,
             'image0': img0_gray_masked,
             'image1': img1_gray_masked,
             'depth0': batch['depth0'],
@@ -474,7 +475,9 @@ class MicKeyTrainingModel(pl.LightningModule):
             # coarse supervision
             compute_supervision_coarse(match_batch, self.cfg)
             # LoFTR matcher
-            self.matcher(match_batch)
+            with torch.no_grad():
+                self.matcher.eval().cuda()
+                self.matcher(match_batch)
             # fine supervision
             compute_supervision_fine(match_batch, self.cfg)
             # LoFTR loss
@@ -482,7 +485,8 @@ class MicKeyTrainingModel(pl.LightningModule):
             loftr_loss_out = self.loftr_loss(match_batch)  #  dict，包含 loss / loss_scalars
             loftr_loss = loftr_loss_out['loss']
         else:
-            self.matcher(match_batch)
+            with torch.no_grad():
+                self.matcher(match_batch)
             # 验证时不计算LoFTR loss
             loftr_loss = torch.tensor(0., device=device)
 
@@ -499,9 +503,10 @@ class MicKeyTrainingModel(pl.LightningModule):
             mkpts1_list.append(mkpts1_f[mask].cpu().numpy())
 
         max_pts = max([len(k) for k in mkpts0_list]) if mkpts0_list else 0
-        print("max_pts:",max_pts)
+        print("length_pts:", [len(k) for k in mkpts0_list])
+
         if max_pts == 0:
-            print("没有找到关键点")
+            print(" max_pts=0,batch got no keypoints")
             #exit()
 
         pts0_batch = torch.zeros(B, max_pts, 2, device=device)
@@ -522,11 +527,23 @@ class MicKeyTrainingModel(pl.LightningModule):
         pred_mask0_flat = pred_mask0_bin.view(B, -1)
         pred_mask1_flat = pred_mask1_bin.view(B, -1)
 
+
+        # 选择使用的掩码
+        if self.use_gt_mask:  #
+            # GT 掩码flat
+            gt_mask0_flat = batch['mask0_gt'].view(B, -1).float()
+            gt_mask1_flat = batch['mask1_gt'].view(B, -1).float()
+            mask0_flat = gt_mask0_flat
+            mask1_flat = gt_mask1_flat
+        else:
+            mask0_flat = pred_mask0_flat
+            mask1_flat = pred_mask1_flat
+
         idx0 = y0 * W + x0  # 一维索引
         idx1 = y1 * W + x1
 
-        m0_vals = torch.gather(pred_mask0_flat, 1, idx0)
-        m1_vals = torch.gather(pred_mask1_flat, 1, idx1)
+        m0_vals = torch.gather(mask0_flat, 1, idx0)
+        m1_vals = torch.gather(mask1_flat, 1, idx1)
         valid_mask_batch = (m0_vals > 0) & (m1_vals > 0)
 
         arange_pts = torch.arange(max_pts, device=device)[None, :].expand(B, -1)
@@ -566,16 +583,24 @@ class MicKeyTrainingModel(pl.LightningModule):
             R[mask_neg] = V[mask_neg] @ U[mask_neg].transpose(-2, -1)
         t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)
 
-        #  R, t 是相机间相对位姿
+        # 转换相对位姿为绝对位姿
         T_rel = torch.eye(4, device=device).unsqueeze(0).repeat(B, 1, 1)
         T_rel[:, :3, :3] = R
-        T_rel[:, :3, 3] = t
+        T_rel[:, :3, 3] = t / 1000.0  # 转换为米
 
-        T_q_pred = T_rel @ item_a_pose  # anchor 绝对姿态 → query 绝对姿态
+        T_a = batch['item_a_pose']  # [B, 4, 4]
+        T_q_pred = T_rel @ T_a
+
         R_pred = T_q_pred[:, :3, :3]
-        t_pred = T_q_pred[:, :3, 3].unsqueeze(1)/1000.
+        t_pred = T_q_pred[:, :3, 3].unsqueeze(1)  # [B, 1, 3]
+
+         # === 修正：无效点处理 ===
+        # for b in range(B):
+        #     if num_valid[b] < 3:
+        #         R_pred[b] = torch.eye(3, device=device)
+        #         t_pred[b] = torch.zeros(1, 3, device=device)
         print("R_pred",R_pred)
-        print("T_pred", t_pred)
+        print("t_pred",t_pred)
 
         return {
             'R_pred': R_pred,
@@ -594,8 +619,8 @@ class MicKeyTrainingModel(pl.LightningModule):
     # -------------------------
     def training_step(self, batch, batch_idx):
         # 兼容 collate
-        if 'pose' in batch and 'T_0to1' not in batch:
-            batch['T_0to1'] = batch['pose']
+        # if 'pose' in batch and 'T_0to1' not in batch:
+        #     batch['T_0to1'] = batch['pose']
 
         # 前向 + 得到预测位姿
         out = self.forward_once(batch, training=True)
