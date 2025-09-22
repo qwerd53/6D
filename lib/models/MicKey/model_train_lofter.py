@@ -82,7 +82,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         # 初始化 matcher
         self.matcher = LoFTR(config=self.loftr_cfg)
         state_dict = torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict']
-        #self.matcher.load_state_dict(state_dict, strict=False)
+        self.matcher.load_state_dict(state_dict, strict=False)
         self.matcher = self.matcher.train().cuda()
 
         # ---------- LoFTR Loss ----------
@@ -435,8 +435,8 @@ class MicKeyTrainingModel(pl.LightningModule):
         pred_mask1_bin = (pred_mask1_prob > self.mask_th).float()
 
         # 灰度图 & mask
-        img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
-        img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
+        img0_gray = self.rgb_to_gray(batch['image0'])# * pred_mask0_bin.unsqueeze(1)
+        img1_gray = self.rgb_to_gray(batch['image1']) #* pred_mask1_bin.unsqueeze(1)
 
         # GT mask，转成 float 并加上 channel 维度以便广播
         mask0_gt = batch['mask0_gt'].unsqueeze(1).float()  # [B,1,H,W]
@@ -453,10 +453,10 @@ class MicKeyTrainingModel(pl.LightningModule):
         T_1to0 = item_a_pose @ torch.inverse(item_q_pose)
         # LoFTR 输入 batch
         match_batch = {
-             'image0': img0_gray,
-             'image1': img1_gray,
-            #'image0': img0_gray_masked,
-            #'image1': img1_gray_masked,
+             # 'image0': img0_gray,
+             # 'image1': img1_gray,
+            'image0': img0_gray_masked,
+            'image1': img1_gray_masked,
             'depth0': batch['depth0'],
             'depth1': batch['depth1'],
             'K0': batch['K_color0'],
@@ -566,9 +566,20 @@ class MicKeyTrainingModel(pl.LightningModule):
             R[mask_neg] = V[mask_neg] @ U[mask_neg].transpose(-2, -1)
         t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)
 
+        #  R, t 是相机间相对位姿
+        T_rel = torch.eye(4, device=device).unsqueeze(0).repeat(B, 1, 1)
+        T_rel[:, :3, :3] = R
+        T_rel[:, :3, 3] = t
+
+        T_q_pred = T_rel @ item_a_pose  # anchor 绝对姿态 → query 绝对姿态
+        R_pred = T_q_pred[:, :3, :3]
+        t_pred = T_q_pred[:, :3, 3].unsqueeze(1)/1000.
+        print("R_pred",R_pred)
+        print("T_pred", t_pred)
+
         return {
-            'R_pred': R,
-            't_pred': t,
+            'R_pred': R_pred,
+            't_pred': t_pred,
             'mask_loss': mask_loss_all,
             'mask_iou': mask_iou_mean,
             'mask0_loss': mask0_loss,
@@ -599,9 +610,9 @@ class MicKeyTrainingModel(pl.LightningModule):
             out['R_pred'], out['t_pred'], R_gt, t_gt, soft_clipping=self.soft_clip
         )
 
-        print("mask_loss:", out['mask_loss'])
-        print("pose_loss:", pose_loss)
-        print("loftr_loss:", out['loftr_loss'])
+        # print("mask_loss:", out['mask_loss'])
+        # print("pose_loss:", pose_loss)
+        # print("loftr_loss:", out['loftr_loss'])
 
         # totalloss
         total_loss = out['mask_loss'] + pose_loss + out['loftr_loss']

@@ -29,8 +29,8 @@ def get_dataset_args_dict(dataset_name='NOCS', root_path='filesOfOryon/data', se
             #'img_size': [480, 640],
             'img_size': [224, 224],
             'max_corrs': 4,
-            #'test': {'name': 'NOCS', 'split': 'val', 'obj': 'all'}
-            'test': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'}
+            'test': {'name': 'NOCS', 'split': 'val', 'obj': 'all'}
+            #'test': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'}
         },
         'TRAINING': {
             'BATCH_SIZE': 32,
@@ -82,8 +82,8 @@ def test_model(args, cfg):
     datamodule = DataModule(
         args_dict,
         train_dataset_name='NOCS',  # 占位，不用训练
-        val_dataset_name='TOYL'
-        #val_dataset_name='NOCS'
+        #val_dataset_name='TOYL'
+        val_dataset_name='NOCS'
     )
     datamodule.setup('test')
 

@@ -296,6 +296,8 @@ class MicKeyTrainingModel(pl.LightningModule):
         # 5) 二值化
         pred_mask0_bin = (pred_mask0_prob > 0.5).float()
         pred_mask1_bin = (pred_mask1_prob > 0.5).float()
+        #pred_mask0_bin = (pred_mask0_prob > 0.3).float()
+        #pred_mask1_bin = (pred_mask1_prob > 0.3).float()
 
         # 6) 灰度图过滤
         img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
