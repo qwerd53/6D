@@ -20,6 +20,17 @@ _CN.model.image_encoder.use_decoder_guidance = True
 _CN.model.image_encoder.use_cost_guidance = True
 _CN.model.image_encoder.decoder_type = "standard"
 
+_CN.loss = CN()
+_CN.loss.hard_negatives= "true"
+_CN.loss.pos_margin= 0.2
+_CN.loss.neg_margin= 0.9
+_CN.loss.neg_kernel_size=5
+_CN.loss.mask_type= "dice"
+# _CN.loss.w.mask=1.0
+# _CN.loss.w.pose=0.5
+# _CN.loss.w.neg=0.5
+
+
 ############# TRAINING #############
 _CN.TRAINING = CN()
 # Data Loader settings

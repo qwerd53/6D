@@ -3,7 +3,8 @@ import pytorch_lightning as pl
 
 from lib.models.MicKey.modules.loss.loss_class import MetricPoseLoss
 from lib.models.MicKey.modules.compute_correspondences import ComputeCorrespondences
-from lib.models.MicKey.modules.utils.training_utils import log_image_matches, debug_reward_matches_log, vis_inliers,log_mask_images
+from lib.models.MicKey.modules.utils.training_utils import log_image_matches, debug_reward_matches_log, vis_inliers, \
+    log_mask_images
 from lib.models.MicKey.modules.utils.probabilisticProcrustes import e2eProbabilisticProcrustesSolver
 
 from lib.utils.metrics import pose_error_torch, vcre_torch
@@ -27,7 +28,6 @@ from lib.models.Oryon.oryon import Oryon
 # LoFTR
 from LOFTER.src.loftr import LoFTR, default_cfg
 
-
 from lib.utils.metrics import pose_error_torch  # 仅用于可选对齐检查（未用于loss）
 from lib.benchmarks.utils import precision_recall  # 日志
 from filesOfOryon.utils.metrics import compute_add, compute_adds  # 用于 ADD/ADD-S
@@ -35,6 +35,15 @@ from filesOfOryon.utils.geo6d import best_fit_transform_with_RANSAC  # 可选的
 # from filesOfOryon.utils.pointdsc.init import get_pointdsc_pose, get_pointdsc_solver  # PointDSC
 from filesOfOryon.utils.losses import DiceLoss, LovaszLoss, FocalLoss
 from filesOfOryon.utils.metrics import mask_iou
+from filesOfOryon.losses import FeatureLoss
+
+from filesOfcatseg.cat_seg.cat_seg_model import CATSeg
+
+# For CATSeg config
+from detectron2.config import get_cfg
+from filesOfcatseg.cat_seg.config import add_cat_seg_config
+
+
 # =========================
 #   MicKeyTrainingModel
 # =========================
@@ -45,6 +54,7 @@ class MicKeyTrainingModel(pl.LightningModule):
     - 损失：mask_loss（BCEWithLogits） + compute_pose_loss（rot_angle + trans_l1，可选tanh clipping）
     - 每半个 epoch 跑一次 ADD(S)-0.1D 评估并记录到 TensorBoard
     """
+
     def __init__(self, cfg):
         super().__init__()
         self.save_hyperparameters(ignore=['cfg'])
@@ -52,7 +62,18 @@ class MicKeyTrainingModel(pl.LightningModule):
 
         # ---------- Oryon ----------
         self.oryon_model = Oryon(cfg, device='cuda' if torch.cuda.is_available() else 'cpu')
-
+        # catseg
+        # # ---------- CATSeg ----------
+        # # 构建配置对象
+        # catseg_cfg = get_cfg()
+        # add_cat_seg_config(catseg_cfg)
+        # # 加载配置文件
+        # catseg_cfg.merge_from_file("filesOfcatseg/configs/config.yaml")
+        # catseg_cfg.freeze()
+        #
+        # # 使用 from_config 方法初始化 CATSeg 模型
+        # catseg_kwargs = CATSeg.from_config(catseg_cfg)
+        # self.CATSeg = CATSeg(**catseg_kwargs)
         # ---------- LoFTR ----------
         # # 你可在 cfg.LOFTR.WEIGHTS 指定权重路径；否则回退到默认路径
         # loftr_weights = getattr(getattr(cfg, 'LOFTR', {}), 'WEIGHTS', 'LOFTER/weights/outdoor_ds.ckpt')
@@ -66,15 +87,20 @@ class MicKeyTrainingModel(pl.LightningModule):
         self.matcher = LoFTR(config=default_cfg)
         self.matcher.load_state_dict(torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict'])
         self.matcher = self.matcher.eval().cuda()
-        #self.matcher = self.matcher.train().cuda()
+        # self.matcher = self.matcher.train().cuda()
         # ---------- 损失 ----------
-        #self._mask_loss = nn.BCEWithLogitsLoss(reduction='mean')  # 用 logits
-        self._mask_loss =DiceLoss(weight=torch.tensor([0.5, 0.5]))
-        self.mask_th =0.5
-        self.soft_clip =True
+        # ---------- 损失 ----------
+        self._mask_loss = DiceLoss(weight=torch.tensor([0.5, 0.5]))
+        self.mask_th = 0.5
+        self.soft_clip = True
+
+        # --- 可选的 feature loss ---
+        self.use_feature_loss = False
+        if self.use_feature_loss:
+            self.feature_loss = FeatureLoss(device='cuda' if torch.cuda.is_available() else 'cpu')
 
         # ---------- 训练控制 ----------
-        self.automatic_optimization = True  #  Lightning 自动优化
+        self.automatic_optimization = True  # Lightning 自动优化
         self.multi_gpu = True
         self.validation_step_outputs = []
         self.log_interval = getattr(cfg.TRAINING, 'LOG_INTERVAL', 50)
@@ -127,19 +153,18 @@ class MicKeyTrainingModel(pl.LightningModule):
         gt_shape = gt.shape[1:]
         pred_shape = pred_logits.shape[2:]
         gt_c = gt.clone()
-        #print(gt.shape, pred.shape)
+        # print(gt.shape, pred.shape)
         # reduce gt dimension if necessary
         if gt_shape != pred_shape:
             gt_c = F.interpolate(gt.unsqueeze(1), pred_shape, mode='nearest').squeeze(1)
 
-        pred_logits  = pred_logits.squeeze(1)
+        pred_logits = pred_logits.squeeze(1)
         loss = self._mask_loss(pred_logits, gt_c.to(torch.float))
         with torch.no_grad():
             pred_mask = torch.where(torch.sigmoid(pred_logits) > self.mask_th, 1, 0)
             iou = mask_iou(gt_c, pred_mask)
 
         return loss, pred_mask, pred_logits, iou.mean()
-
 
     def compute_pose_loss(self, R, t, Rgt_i, tgt_i, soft_clipping=True):
         """
@@ -149,8 +174,8 @@ class MicKeyTrainingModel(pl.LightningModule):
         Rgt:  [B,3,3]
         tgt:  [B,1,3]
         """
-        loss_rot, _ = self.rot_angle_loss(R, Rgt_i)          # [B,1]
-        loss_trans = self.trans_l1_loss(t, tgt_i)            # [B,1,3] -> [B,1]
+        loss_rot, _ = self.rot_angle_loss(R, Rgt_i)  # [B,1]
+        loss_trans = self.trans_l1_loss(t, tgt_i)  # [B,1,3] -> [B,1]
 
         if soft_clipping:
             loss_trans_soft = torch.tanh(loss_trans / 0.9)
@@ -253,10 +278,13 @@ class MicKeyTrainingModel(pl.LightningModule):
         device = batch['image0'].device
         B, _, H, W = batch['image0'].shape
 
-        # 1) Oryon 输出（假定返回 logits 形态）
+        #1) Oryon 输出（假定返回 logits 形态）
         oryon_out = self.oryon_model.forward(batch)  # 包含 'mask_a', 'mask_q'
         pred_mask0_logits = oryon_out['mask_a']  # [B,1,Hm,Wm]
         pred_mask1_logits = oryon_out['mask_q']  # [B,1,Hm,Wm]
+        # catseg_out = self.oryon_model.forward(batch)  # 包含 'mask_a', 'mask_q'
+        # pred_mask0_logits = catseg_out['mask_a']  # [B,1,Hm,Wm]
+        # pred_mask1_logits = catseg_out['mask_q']  # [B,1,Hm,Wm]
 
         # 2) mask loss
         mask0_gt = batch['mask0_gt']  # [B,H,W]
@@ -292,7 +320,7 @@ class MicKeyTrainingModel(pl.LightningModule):
             match_batch = {'image0': img0_gray[i:i + 1], 'image1': img1_gray[i:i + 1]}
             with torch.no_grad():
                 self.matcher.eval()
-                #self.matcher.train()
+                # self.matcher.train()
                 self.matcher(match_batch)
 
             mkpts0 = match_batch['mkpts0_f'].detach().cpu().numpy()
@@ -324,7 +352,6 @@ class MicKeyTrainingModel(pl.LightningModule):
             depth1 = batch['depth1'][i].detach().cpu().numpy()
             K0 = batch['K_color0'][i].detach().cpu().numpy()
             K1 = batch['K_color1'][i].detach().cpu().numpy()
-
 
             # current_h, current_w = batch['image0'][i].shape[1:]
             # K0 = self.adjust_intrinsics_for_resize(K0, original_size=(640, 480),
@@ -376,46 +403,46 @@ class MicKeyTrainingModel(pl.LightningModule):
     #     Lightning Hooks
     # -------------------------
     def training_step(self, batch, batch_idx):
-        # 兼容你之前的自定义 collate 字段
-        if 'pose' in batch and 'T_0to1' not in batch:
-            batch['T_0to1'] = batch['pose']
-
-        # 前向 + 得到预测位姿
+        # 前向
         out = self.forward_once(batch)
 
         # GT 绝对位姿（query）
-        T_q_gt = batch['item_q_pose']  # [B,4,4]
+        T_q_gt = batch['item_q_pose']
         R_gt = T_q_gt[:, :3, :3]
-        t_gt = T_q_gt[:, :3, 3].unsqueeze(1)  # [B,1,3]，单位 m
+        t_gt = T_q_gt[:, :3, 3].unsqueeze(1)
 
-        # 姿态损失
-        #pose_loss, pose_rot_loss, pose_trans_loss=0,0,0
-        pose_loss, pose_rot_loss, pose_trans_loss = self.compute_pose_loss(
-            out['R_pred'], out['t_pred'], R_gt, t_gt, soft_clipping=self.soft_clip
-        )
+        if self.use_feature_loss:
+            # ====== 调用 feature loss ======
+            feat_losses, feat_results = self.feature_loss(batch, out)
+            feat_loss = feat_losses['pos'] + feat_losses['neg'] + feat_losses['mask']
+            total_loss = feat_loss
 
-        total_loss = out['mask_loss'] + pose_loss
+            # ---- 日志 ----
+            self.log('train/feature_pos_loss', feat_losses['pos'], prog_bar=False, on_step=True, on_epoch=True)
+            self.log('train/feature_neg_loss', feat_losses['neg'], prog_bar=False, on_step=True, on_epoch=True)
+            self.log('train/feature_mask_loss', feat_losses['mask'], prog_bar=True, on_step=True, on_epoch=True)
+            self.log('train/feature_total_loss', feat_loss, prog_bar=True, on_step=True, on_epoch=True)
 
-        # ---- 日志 ----
-        self.log('train/mask_loss', out['mask_loss'], prog_bar=True, on_step=True, on_epoch=True)
-        # self.log('train/mask_iou', out['mask_iou'], prog_bar=False, on_step=True, on_epoch=True)\
-        self.log('train/mask_iou', out['mask_iou'], prog_bar=False, on_step=True, on_epoch=True)
+            # 置零，防止日志报错
+            pose_loss = torch.tensor(0.0, device=feat_loss.device)
+            pose_rot_loss = torch.tensor(0.0, device=feat_loss.device)
+            pose_trans_loss = torch.tensor(0.0, device=feat_loss.device)
 
-        self.log('train/pose_loss', pose_loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log('train/pose_rot_loss', pose_rot_loss, prog_bar=False, on_step=True, on_epoch=True)
-        self.log('train/pose_trans_loss', pose_trans_loss, prog_bar=False, on_step=True, on_epoch=True)
+        else:
+            # ====== 计算 pose loss ======
+            pose_loss, pose_rot_loss, pose_trans_loss = self.compute_pose_loss(
+                out['R_pred'], out['t_pred'], R_gt, t_gt, soft_clipping=self.soft_clip
+            )
+            total_loss = out['mask_loss'] + pose_loss
+
+            # ---- 日志 ----
+            self.log('train/mask_loss', out['mask_loss'], prog_bar=True, on_step=True, on_epoch=True)
+            self.log('train/pose_loss', pose_loss, prog_bar=True, on_step=True, on_epoch=True)
+            self.log('train/pose_rot_loss', pose_rot_loss, prog_bar=False, on_step=True, on_epoch=True)
+            self.log('train/pose_trans_loss', pose_trans_loss, prog_bar=False, on_step=True, on_epoch=True)
+
+        # 总 loss 日志
         self.log('train/total_loss', total_loss, prog_bar=True, on_step=True, on_epoch=True)
-
-        # ---- 半个 epoch 触发 ADD(S)-0.1D 评估 ----
-        # if (self._half_epoch_batch_idx is not None
-        #     and batch_idx >= self._half_epoch_batch_idx
-        #     and not self._ran_half_eval_for_epoch):
-        #     self._ran_half_eval_for_epoch = True
-        #     with torch.no_grad():
-        #         add_acc = self.run_add01d_eval()
-        #     if add_acc is not None:
-        #         self.log('eval_half_epoch/add01d_acc(%)', add_acc, prog_bar=True, on_step=False, on_epoch=True)
-
         return total_loss
 
     # def on_train_epoch_start(self):
@@ -505,7 +532,6 @@ class MicKeyTrainingModel(pl.LightningModule):
         add_acc = self.run_add01d_eval()
         add_acc = float(add_acc)
         if add_acc is not None:
-
             self.log('val/add01d_acc', add_acc, prog_bar=True, on_epoch=True, sync_dist=self.multi_gpu)
 
         self.validation_step_outputs.clear()
@@ -572,7 +598,7 @@ class MicKeyTrainingModel(pl.LightningModule):
 
             # 预测绝对姿态
             out = self.forward_once(batch)
-            R_pred = out['R_pred']           # [B,3,3]
+            R_pred = out['R_pred']  # [B,3,3]
             t_pred = out['t_pred'].squeeze(1)  # [B,3] (m)
 
             # GT 绝对姿态

@@ -17,7 +17,7 @@ class LoFTR(nn.Module):
 
         # Modules
         self.backbone = build_backbone(config)
-        print("self.backbone",self.backbone)
+        #print("self.backbone",self.backbone)
         self.pos_encoding = PositionEncodingSine(
             config['coarse']['d_model'],
             temp_bug_fix=config['coarse']['temp_bug_fix'])

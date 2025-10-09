@@ -1,0 +1,138 @@
+# talk2dino_utils.py
+import torch
+import clip
+import os
+from lib.models.Oryon.t2d.model import ProjectionLayer
+from torch import nn
+import torch.nn.functional as F
+import sys
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
+# 添加上一级目录到系统路径
+sys.path.append('..')
+# DINOv2 backbone
+#from dinov2.models import dinov2_vitb14
+dinov2_vitb14 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vitb14',pretrained=True)
+from lib.models.Oryon.tokenizer import SimpleTokenizer  # 修改为实际路径
+class DINOV2BackboneWithAttn(nn.Module):
+    """
+    封装 DINOv2 backbone，自动提取特征和 attention maps
+    """
+    def __init__(self, device=None):
+        super().__init__()
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = dinov2_vitb14.to(self.device)
+        self.model.eval()
+
+        # 保存注意力 maps
+        self.attn_maps = []
+
+        # 注册 hook 到每个 Attention 层
+        for blk in self.model.blocks:
+            blk.attn.register_forward_hook(self._make_attn_hook())
+
+    def _make_attn_hook(self):
+        def hook(module, input, output):
+            """
+            output: Attention 层输出
+            新版 DINOv2 输出通常是 attn 矩阵或 tuple (x_out, attn)
+            """
+            # 如果是 tuple，则取第二个元素作为 attn
+            attn = output[1] if isinstance(output, tuple) else output
+            self.attn_maps.append(attn.detach())
+        return hook
+
+    @torch.no_grad()
+    def forward_features_and_attn(self, img: torch.Tensor):
+        """
+        img: [B,3,H,W] normalized
+        returns:
+          - feat_map: [B,C,Hf,Wf]
+          - attn_maps_proc: list of [B,num_heads,Hf,Wf]
+        """
+        self.attn_maps = []  # 清空上一次记录
+
+        feat_map = self.model.forward_features(img)  # [B, C, Hf, Wf]
+
+        # 处理 attention maps，去掉 cls token 并 reshape 成 [B, heads, Hf, Wf]
+        attn_maps_proc = []
+        for attn in self.attn_maps:
+            B, H, N, _ = attn.shape
+            patch_attn = attn[:, :, 0, 1:]  # 去掉 cls token
+            size = int((N - 1) ** 0.5)      # N_patches = N-1
+            patch_attn = patch_attn.view(B, H, size, size)
+            attn_maps_proc.append(patch_attn)
+
+        return feat_map, attn_maps_proc
+
+class Talk2DINO:
+    """
+    Talk2DINO pipeline:
+    1. CLIP文本 -> DINOv2空间投影
+    2. DINOv2特征 + attention map 加权 -> 视觉嵌入
+    3. 返回视觉嵌入和投影后的文本特征
+    """
+    def __init__(self, proj_name='vitb_mlp_infonce', device=None):
+        self.device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
+
+        # Text projection
+        self.config_path = os.path.join("config", f"{proj_name}.yaml")
+        self.weights_path = os.path.join("weights", f"{proj_name}.pth")
+        self.proj = ProjectionLayer.from_config(self.config_path)
+        self.proj.load_state_dict(torch.load(self.weights_path, map_location=self.device))
+        self.proj.to(self.device)
+        self.proj.eval()
+
+        # CLIP
+        self.clip_model, self.clip_preprocess = clip.load("ViT-B/16", device=self.device, jit=False)
+        self.tokenizer = SimpleTokenizer()  # 替代 clip.tokenize
+
+        # DINOv2 backbone + attention
+        self.dino = DINOV2BackboneWithAttn(self.device)
+
+
+    @torch.no_grad()
+    def project_text(self, texts):
+        """
+        texts: list of str 或嵌套列表
+        returns: projected text features [B, C_dino]
+        """
+        # 如果是嵌套列表，先 flatten
+        flattened_texts = []
+        for t in texts:
+            if isinstance(t, list):
+                flattened_texts.extend([str(x) for x in t])
+            else:
+                flattened_texts.append(str(t))
+
+        # 使用自定义 tokenizer
+        tokens = self.tokenizer(flattened_texts).to(self.device)  # context_length 默认为 77，可修改
+        clip_feat = self.clip_model.encode_text(tokens)
+        proj_feat = self.proj.project_clip_txt(clip_feat)
+        return proj_feat
+
+    @torch.no_grad()
+    def extract_visual_embeddings(self, img: torch.Tensor, attn_maps: list):
+        """
+        img: [B,3,H,W] normalized in [0,1]
+        attn_maps: list of attention maps from DINOv2 [B, num_heads, Hf, Wf]
+        returns: visual embeddings [B, total_N, C_dino]
+        """
+        # 1. DINOv2 dense feature map
+        feat_map, _ = self.dino.forward_features_and_attn(img)  # [B, C, Hf, Wf]
+        B, C, Hf, Wf = feat_map.shape
+
+        embeddings = []
+        for attn in attn_maps:
+            # attn: [B, heads, Hf, Wf]
+            B_attn, H, H_attn, W_attn = attn.shape
+            assert B_attn == B
+            attn_flat = attn.view(B, H, -1)  # [B, heads, Hf*Wf]
+            feat_flat = feat_map.view(B, C, -1).permute(0, 2, 1)  # [B,Hf*Wf,C]
+            emb = torch.bmm(attn_flat, feat_flat)  # [B, heads, C]
+            emb = emb / (attn_flat.sum(-1, keepdim=True) + 1e-6)  # 加权平均
+            embeddings.append(emb)
+
+        embeddings = torch.cat(embeddings, dim=1)  # [B, total_heads, C]
+        return embeddings

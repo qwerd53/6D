@@ -374,7 +374,7 @@ class Shapenet6DDataset(Dataset):
         valid = valid_a and valid_q and valid_corrs
 
         #return item_a, item_q, prompt, pose, obj_id, instance_id
-        return item_a, item_q, prompt, pose, cat_id, instance_id
+        return item_a, item_q, prompt, pose, cat_id, instance_id#,sampled_corrs
         # return item_a, item_q, prompt, sampled_corrs, orig_corrs, pose, cat_id, instance_id, valid
 
     # def __getitem__(self, index : int, i=0) -> Tuple:
@@ -573,7 +573,10 @@ class NOCSDataset(Dataset):
 
        # prompt = self.get_item_prompt(item_a)[0]
         #prompt = self.get_item_prompt(item_a)[:1]  # shape 保持为 [1, C, H, W]
-        prompt = self.get_item_prompt(item_a)
+
+
+        prompt = self.get_item_prompt(item_a) #80
+        #prompt = [prompt[0]] * len(prompt)
         # print(pose)
         #print(prompt)
         #print(np.shape(prompt))

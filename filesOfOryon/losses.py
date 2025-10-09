@@ -13,16 +13,28 @@ class FeatureLoss(torch.nn.Module):
     '''
     Contrastive learning loss with positive and negative samples
     '''
-    def __init__(self, args : DictConfig, device : str):
+    # def __init__(self, args : DictConfig, device : str):
+    def __init__(self, device: str):
+
+        # loss:
+        # hard_negatives: true
+        # pos_margin: 0.2
+        # neg_margin: 0.9
+        # neg_kernel_size: 5
+        # mask_type: dice
+        # w:
+        # mask: 1.0
+        # pos: 0.5
+        # neg: 0.5
         super().__init__()
         self.device = device
-        self.args = args
-        self.pos_margin = args.loss.pos_margin
-        self.neg_margin = args.loss.neg_margin
-        self.neg_kernel = args.loss.neg_kernel_size
-        self.hard_negatives = args.loss.hard_negatives
-        self.mask_th = args.test.mask_threshold
-        self.mask_type = args.loss.mask_type
+        #self.args = args
+        self.pos_margin = 0.2
+        self.neg_margin = 0.9
+        self.neg_kernel = 5
+        self.hard_negatives = "true"
+        self.mask_th = 0.5
+        self.mask_type = "dice"
         
         if self.mask_type == 'cross_entropy':
             self._mask_loss = torch.nn.BCEWithLogitsLoss()

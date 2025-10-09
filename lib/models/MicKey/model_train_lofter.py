@@ -80,15 +80,18 @@ class MicKeyTrainingModel(pl.LightningModule):
         self.loftr_cfg = _config['loftr']
         print("self.loftr_cfg:",self.loftr_cfg)
         # 初始化 matcher
+        #default_cfg['coarse']['temp_bug_fix'] = False
         self.matcher = LoFTR(config=self.loftr_cfg)
         state_dict = torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict']
-        self.matcher.load_state_dict(state_dict, strict=False)
+        self.matcher.load_state_dict(state_dict)
         self.matcher = self.matcher.train().cuda()
-        self.matcher = self.matcher.eval().cuda()
+        #self.matcher = self.matcher.eval().cuda()
+        self.loftr_fine_tune_mode = 'conservative'  # 'conservative', 'minimal', 'none'
+        self._setup_loftr_fine_tuning()
         # ---------- LoFTR Loss ----------s
         self.loftr_loss = LoFTRLoss(_config).train()
-        self.use_gt_mask=True #filter 2d keypoints
-
+        #self.use_gt_mask=True #filter 2d keypoints
+        self.use_gt_mask =True
         # ---------- Mask Loss ----------
         self._mask_loss = DiceLoss(weight=torch.tensor([0.5, 0.5]))
         self.mask_th = 0.5
@@ -103,6 +106,80 @@ class MicKeyTrainingModel(pl.LightningModule):
         # 半 epoch 评估
         self._ran_half_eval_for_epoch = False
         self._half_epoch_batch_idx = None
+
+    def _setup_loftr_fine_tuning(self):
+        """
+        设置LoFTR的极小微调策略：
+         - 'none': 完全冻结LoFTR
+        - 'minimal': 只训练温度参数
+        - 'conservative': 训练最后1层transformer + 温度参数
+        """
+        if self.loftr_fine_tune_mode == 'none':
+            # 完全冻结LoFTR
+            for param in self.matcher.parameters():
+                param.requires_grad = False
+            print("完全冻结LoFTR参数")
+
+        elif self.loftr_fine_tune_mode == 'minimal':
+            # 只训练温度参数
+            for param in self.matcher.parameters():
+                param.requires_grad = False
+
+            # 只训练coarse matching的温度参数
+            if hasattr(self.matcher.coarse_matching, 'temperature'):
+                self.matcher.coarse_matching.temperature.requires_grad = True
+                print("只训练coarse matching温度参数")
+            else:
+                print("警告：找不到温度参数，完全冻结LoFTR")
+
+        elif self.loftr_fine_tune_mode == 'conservative':
+            # 冻结backbone
+            for param in self.matcher.backbone.parameters():
+                param.requires_grad = False
+            print("冻结LoFTR backbone参数")
+
+            # 冻结位置编码
+            for param in self.matcher.pos_encoding.parameters():
+                param.requires_grad = False
+            print("冻结LoFTR位置编码参数")
+
+            # 只训练最后1层coarse transformer
+            coarse_layers = self.matcher.loftr_coarse.layers
+            for i, layer in enumerate(coarse_layers):
+                if i < len(coarse_layers) - 1:  # 冻结前几层
+                    for param in layer.parameters():
+                        param.requires_grad = False
+                else:  # 只训练最后一层
+                    print(f"训练coarse transformer第{i + 1}层")
+
+            # 冻结fine transformer
+            for param in self.matcher.loftr_fine.parameters():
+                param.requires_grad = False
+            print("冻结LoFTR fine transformer参数")
+
+            # 冻结fine preprocessing
+            for param in self.matcher.fine_preprocess.parameters():
+                param.requires_grad = False
+            print("冻结LoFTR fine preprocessing参数")
+
+            # 冻结fine matching
+            for param in self.matcher.fine_matching.parameters():
+                param.requires_grad = False
+            print("冻结LoFTR fine matching参数")
+
+            # 训练coarse matching的温度参数
+            if hasattr(self.matcher.coarse_matching, 'temperature'):
+                print("训练coarse matching温度参数")
+            else:
+                for param in self.matcher.coarse_matching.parameters():
+                    param.requires_grad = False
+                print("冻结coarse matching参数")
+
+        # 统计可训练参数
+        total_params = sum(p.numel() for p in self.matcher.parameters())
+        trainable_params = sum(p.numel() for p in self.matcher.parameters() if p.requires_grad)
+        print(f"LoFTR总参数: {total_params / 1e6:.1f}M")
+        print(f"LoFTR可训练参数: {trainable_params / 1e6:.1f}M ({trainable_params / total_params * 100:.1f}%)")
 
     def forward(self, batch):
         return self.forward_once(batch)
@@ -475,9 +552,9 @@ class MicKeyTrainingModel(pl.LightningModule):
             # coarse supervision
             compute_supervision_coarse(match_batch, self.cfg)
             # LoFTR matcher
-            with torch.no_grad():
-                self.matcher.eval().cuda()
-                self.matcher(match_batch)
+            #with torch.no_grad():
+                #self.matcher.eval().cuda()
+            self.matcher(match_batch)
             # fine supervision
             compute_supervision_fine(match_batch, self.cfg)
             # LoFTR loss
@@ -524,8 +601,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         x1 = pts1_batch[..., 0].long()
         y1 = pts1_batch[..., 1].long()
 
-        pred_mask0_flat = pred_mask0_bin.view(B, -1)
-        pred_mask1_flat = pred_mask1_bin.view(B, -1)
+
 
 
         # 选择使用的掩码
@@ -536,6 +612,8 @@ class MicKeyTrainingModel(pl.LightningModule):
             mask0_flat = gt_mask0_flat
             mask1_flat = gt_mask1_flat
         else:
+            pred_mask0_flat = pred_mask0_bin.view(B, -1)
+            pred_mask1_flat = pred_mask1_bin.view(B, -1)
             mask0_flat = pred_mask0_flat
             mask1_flat = pred_mask1_flat
 
@@ -557,6 +635,8 @@ class MicKeyTrainingModel(pl.LightningModule):
 
         z0 = depth0[torch.arange(B)[:, None], 0, y0, x0]
         z1 = depth1[torch.arange(B)[:, None], 0, y1, x1]
+        # 深度有效性过滤（z>0）
+        valid_mask_batch = valid_mask_batch & (z0 > 0) & (z1 > 0)
 
         pts3d0 = torch.stack([x0 * z0, y0 * z0, z0], dim=-1) @ K0_inv.transpose(1, 2)
         pts3d1 = torch.stack([x1 * z1, y1 * z1, z1], dim=-1) @ K1_inv.transpose(1, 2)
@@ -583,6 +663,14 @@ class MicKeyTrainingModel(pl.LightningModule):
             R[mask_neg] = V[mask_neg] @ U[mask_neg].transpose(-2, -1)
         t = centroid1 - torch.einsum('bij,bj->bi', R, centroid0)
 
+        # 有效点数 < 3 的样本回退到单位姿态与零平移
+        has_valid = (valid_mask_batch.sum(dim=1) >= 3)
+        if (~has_valid).any():
+            R_fallback = torch.eye(3, device=device).unsqueeze(0).repeat(B, 1, 1)
+            t_fallback = torch.zeros(B, 3, device=device)
+            R = torch.where(has_valid.view(B, 1, 1), R, R_fallback)
+            t = torch.where(has_valid.view(B, 1), t, t_fallback)
+
         # 转换相对位姿为绝对位姿
         T_rel = torch.eye(4, device=device).unsqueeze(0).repeat(B, 1, 1)
         T_rel[:, :3, :3] = R
@@ -599,8 +687,8 @@ class MicKeyTrainingModel(pl.LightningModule):
         #     if num_valid[b] < 3:
         #         R_pred[b] = torch.eye(3, device=device)
         #         t_pred[b] = torch.zeros(1, 3, device=device)
-        print("R_pred",R_pred)
-        print("t_pred",t_pred)
+        # print("R_pred",R_pred)
+        # print("t_pred",t_pred)
 
         return {
             'R_pred': R_pred,
@@ -640,7 +728,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         # print("loftr_loss:", out['loftr_loss'])
 
         # totalloss
-        total_loss = out['mask_loss'] + pose_loss + out['loftr_loss']
+        total_loss =out['mask_loss'] + pose_loss + 0*out['loftr_loss']
 
         # ---- 日志 ----
         self.log('train/mask_loss', out['mask_loss'], prog_bar=True, on_step=True, on_epoch=True)
