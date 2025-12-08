@@ -37,7 +37,7 @@ from lib.datasets.datamodules import DataModule
 from omegaconf import DictConfig
 from pytorch_lightning.strategies import DDPStrategy
 def get_dataset_args_dict(dataset_name: str, root_path: str, seed: int = 42):
-    assert dataset_name in ['Shapenet6D', 'NOCS', 'TOYL'], f"Unsupported dataset: {dataset_name}"
+    assert dataset_name in ['Shapenet6D', 'NOCS', 'TOYL','YCBV'], f"Unsupported dataset: {dataset_name}"
     if dataset_name == 'Shapenet6D':
         obj_id, name = 'all', 'ShapeNet6D'
     elif dataset_name == 'NOCS':
@@ -45,6 +45,10 @@ def get_dataset_args_dict(dataset_name: str, root_path: str, seed: int = 42):
         #obj_id, name = '1', 'NOCS'
     elif dataset_name == 'TOYL':
         obj_id, name = 'all', 'TOYL'
+    elif dataset_name == 'YCBV':
+        obj_id, name = 'all', 'YCBV'
+    elif dataset_name == 'LM':
+        obj_id, name = 'all', 'LM'
 
     args_dict = {
         'dataset': {
@@ -59,11 +63,13 @@ def get_dataset_args_dict(dataset_name: str, root_path: str, seed: int = 42):
             'train_toyl': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'},
             #'test': {'name': name, 'split': 'val', 'obj': obj_id}
             #'test': {'name': 'NOCS', 'split': 'val', 'obj': 'all'} #nocs
-            'test': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'}
+            #'test': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'}
+           # 'test': {'name': 'YCBV', 'split': 'test', 'obj': 'all'}  # ycbv
+            'test': {'name': 'LM', 'split': 'test', 'obj': 'all'}  # LM
         },
         'TRAINING': {
             'BATCH_SIZE': 32 , #8,
-            'NUM_WORKERS':4,  #16,
+            'NUM_WORKERS':2,  #16,
             'SAMPLER': 'scene_balance',
             # 'N_SAMPLES_SCENE': 100,
             'N_SAMPLES_SCENE':4,
@@ -160,7 +166,9 @@ def train_model(args, cfg):
         args_dict,
         train_dataset_name='Shapenet6D',
         #val_dataset_name='NOCS'
-        val_dataset_name='TOYL'
+        #val_dataset_name='TOYL'
+        #val_dataset_name='YCBV'
+        val_dataset_name='LM'
     )
 
     ckpt_path = args.resume if args.resume else None

@@ -3,7 +3,7 @@ import torch.utils as utils
 from torch.utils.data import DataLoader
 import pytorch_lightning as pl
 
-from filesOfOryon.datasets import Shapenet6DDataset, NOCSDataset, TOYLDataset
+from filesOfOryon.datasets import Shapenet6DDataset, NOCSDataset, TOYLDataset,YCBVDataset,LMDataset
 from lib.datasets.sampler import RandomConcatSampler
 
 from torch.utils.data import ConcatDataset
@@ -173,7 +173,9 @@ class DataModule(pl.LightningDataModule):
         self.datasets_map = {
             'Shapenet6D': Shapenet6DDataset,
             'NOCS': NOCSDataset,
-            'TOYL': TOYLDataset
+            'TOYL': TOYLDataset,
+            'YCBV': YCBVDataset,
+            'LM': LMDataset
         }
 
         # 指定训练集和验证集类
@@ -202,6 +204,12 @@ class DataModule(pl.LightningDataModule):
         dataset = self.train_dataset_class(self.args, eval=False)
         print(f"Loaded training dataset with {len(dataset)} samples")
 
+
+        # # -------- 只取十分之一数据 --------
+        # subset_size = max(1, len(dataset) // 10)
+        # subset_indices = torch.randperm(len(dataset))[:subset_size]
+        # dataset = Subset(dataset, subset_indices)
+        # print(f"Using subset of {len(dataset)} samples for fast debug")
     #    使用完整数据
         #sampler = self.get_sampler(dataset)
 
@@ -210,7 +218,7 @@ class DataModule(pl.LightningDataModule):
         dataset = ConcatDataset([dataset])
 
         sampler = self.get_sampler(dataset)
-        collate_fn = dataset.datasets[0].collate
+        #collate_fn = dataset.datasets[0].collate
         return DataLoader(
             dataset,
             batch_size=self.args['TRAINING']['BATCH_SIZE'],
@@ -269,7 +277,9 @@ class DataModule(pl.LightningDataModule):
     #     )
 
     def val_dataloader(self):
+        print(self.args)
         dataset = self.val_dataset_class(self.args, eval=True)
+
         print(f"Loaded valting dataset with {len(dataset)} samples")
         return DataLoader(
             dataset,

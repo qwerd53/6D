@@ -76,6 +76,9 @@ def preprocess_item(item: dict) -> dict:
             new_poses.append(v.clone().detach())
         item['metadata']['poses'] = new_poses
 
+
+    # print("mask_id:",item['metadata']['mask_ids'][0])
+    # print("mask:",item['mask'])
     mask_id = item['metadata']['mask_ids'][0]
     mask = torch.where(item['mask'] == mask_id, 1, 0)
     item['mask'] = mask

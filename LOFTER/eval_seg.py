@@ -6,7 +6,7 @@ import os, sys
 sys.path.append(os.getcwd())
 from lib.datasets.datamodules import DataModule
 #import filesOfOryon.datasets
-from filesOfOryon.datasets import Shapenet6DDataset, NOCSDataset, TOYLDataset
+from filesOfOryon.datasets import Shapenet6DDataset, NOCSDataset, TOYLDataset,YCBVDataset
 from filesOfOryon.utils.geo6d import best_fit_transform_with_RANSAC
 from filesOfOryon.utils.pointdsc.init import get_pointdsc_pose, get_pointdsc_solver
 
@@ -61,10 +61,13 @@ def get_dataset_args_dict(dataset_name: str, root_path: str, seed: int = 42):
         'dataset': {
             'root': root_path,
             #'img_size':[480,640], #[480,640],\
-            'img_size': [224, 224],
+            'img_size': [480,640],
             'max_corrs': 4,
             'train': {'name': name, 'split': 'train', 'obj': obj_id},
-            'test': {'name': name, 'split': 'val', 'obj': obj_id}
+            #'test': {'name': name, 'split': 'val', 'obj': obj_id} for nocs
+           # 'test': {'name': name, 'split': 'cross_scene_test', 'obj': obj_id},#for toyl
+
+            'test': {'name': name, 'split': 'test', 'obj': obj_id}#for ycbv
         },
         'TRAINING': {
             'BATCH_SIZE': 32,
@@ -136,7 +139,7 @@ if __name__ == '__main__':
         pointdsc_solver = get_pointdsc_solver("/data/WDY/mickey-main/pretrained_models/pointdsc", 'cuda')
 
     dataset_root = 'filesOfOryon/data'
-    dataset_name = 'NOCS'
+    dataset_name = 'YCBV'
     args_dict, dataset_name = get_dataset_args_dict(dataset_name, dataset_root)
 
     dataset_args = DictConfig(args_dict)
@@ -146,10 +149,18 @@ if __name__ == '__main__':
         dataset = Shapenet6DDataset(dataset_args, eval=True)
     elif dataset_name.lower() == 'toyl':
         dataset = TOYLDataset(dataset_args, eval=True)
+    elif dataset_name.lower() == 'ycbv':
+        dataset = YCBVDataset(dataset_args, eval=True)
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")
 
-    datamodule = DataModule(DictConfig(args_dict), dataset_name)
+    #datamodule = DataModule(DictConfig(args_dict), dataset_name)
+    datamodule = DataModule(
+        DictConfig(args_dict),
+        train_dataset_name='NOCS',  # 占位，不用训练
+        val_dataset_name='YCBV'
+        # val_dataset_name='NOCS'
+    )
     datamodule.setup(stage='fit')
 
     dataloader = datamodule.val_dataloader()
@@ -210,7 +221,7 @@ if __name__ == '__main__':
             mconf = match_batch['mconf'].cpu().numpy()
 
             # if len(mkpts0) < 3:
-            #     continue
+            #     continueg
 
             #mask
             mask0_i = mask0_gt[i, 0].cpu().numpy()
@@ -225,8 +236,11 @@ if __name__ == '__main__':
 
             print(f"Total matches: {len(match_batch['mkpts0_f'])}, after mask filtering: {len(mkpts0)}")
 
-            depth0 = batch['depth0'][i].cpu().numpy()
-            depth1 = batch['depth1'][i].cpu().numpy() #print(depth0,depth0.shape)
+            depth0 = batch['depth0'][i].cpu().numpy()/10.
+            depth1 = batch['depth1'][i].cpu().numpy()/10. #print(depth0,depth0.shape)
+
+
+
             K0 = batch['K_color0'][i].cpu().numpy()   #(3,3)
             K1 = batch['K_color1'][i].cpu().numpy()
             current_height, current_width = batch['image0'][i].shape[1:]

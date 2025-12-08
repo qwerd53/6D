@@ -1,0 +1,13 @@
+TRAINING:
+  BATCH_SIZE: 32
+  NUM_WORKERS: 8
+  SAMPLER: scene_balance
+  N_SAMPLES_SCENE: 4
+  SAMPLE_WITH_REPLACEMENT: true
+
+dataset:
+  train_shapenet:
+    data_path: /path/to/shapenet/data
+    image_size: [448, 448]
+    use_depth: true
+    use_mask: true

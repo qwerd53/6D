@@ -1,14 +1,23 @@
 import os
 import torch
 import sys
-
+#sys.path.append("/data/WDY/Talk2DINO")
 sys.path.append(os.getcwd())
+import sys
+#sys.path.append("/data/WDY/Talk2DINO")  # 添加 Talk2DINO 根目录
+import ssl
+ssl._create_default_https_context = ssl._create_unverified_context
+
 import pytorch_lightning as pl
 import random
 import argparse
 from omegaconf import DictConfig
 from yacs.config import CfgNode as CN
-from lib.models.MicKey.model_test import MicKeyTrainingModel
+
+#from lib.models.MicKey.model_test import MicKeyTrainingModel
+#from lib.models.MicKey.model_test_sift import MicKeyTrainingModel
+from lib.models.MicKey.model_test_objmatching import MicKeyTrainingModel
+#from lib.models.MicKey.model_test_talk2dino import MicKeyTrainingModel
 from lib.datasets.datamodules import DataModule
 
 
@@ -27,10 +36,12 @@ def get_dataset_args_dict(dataset_name='NOCS', root_path='filesOfOryon/data', se
             'root': root_path,
             #'img_size': [224, 224],
             #'img_size': [480, 640],
-            'img_size': [224, 224],
+            'img_size': [480, 640],
             'max_corrs': 4,
             'test': {'name': 'NOCS', 'split': 'val', 'obj': 'all'}
             #'test': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'}
+            #'test': {'name': 'YCBV', 'split': 'test', 'obj': 'all'}
+            #'test': {'name': 'LM', 'split': 'test', 'obj': 'all'}
         },
         'TRAINING': {
             'BATCH_SIZE': 32,
@@ -75,6 +86,8 @@ def test_model(args, cfg):
         #map_location='cuda' if torch.cuda.is_available() else 'cpu'
         map_location='cuda:1'
     )
+    # model.eval()
+    #model = MicKeyTrainingModel(cfg=cfg)
     model.eval()
 
     # Setup datamodule
@@ -84,6 +97,8 @@ def test_model(args, cfg):
         train_dataset_name='NOCS',  # 占位，不用训练
         #val_dataset_name='TOYL'
         val_dataset_name='NOCS'
+       #val_dataset_name='YCBV'
+        #val_dataset_name='LM'
     )
     datamodule.setup('test')
 
@@ -112,10 +127,14 @@ def test_model(args, cfg):
 if __name__ == '__main__':
     # Setup environment
     setup_environment()
-
+    ##
+    #nocs:weights/lofter_Dicemask_shapenet_flip_lr/version_18/checkpoints/epoch=15-best_addval/add01d_acc=40.827.ckpt
+    #toyl:weights/lofter_Dicemask_shapenet_flip_lr1e-3_valTOYL/version_2/checkpoints/epoch=5-best_addval/add01d_acc=53.000.ckpt
+    #ycbv:weights/ycbv/version_0/checkpoints/epoch=3-best_addval/add01d_acc=0.200.ckpt
+    #LM:weights/LM/version_2/checkpoints/epoch=15-best_addval/add01d_acc=9.775.ckpt
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', default='weights/lofter_Dicemask_shapenet_flip_lr/version_9/checkpoints/epoch=9-best_addval/add01d_acc=39.667.ckpt')
+    parser.add_argument('--checkpoint', default='weights/lofter_Dicemask_shapenet_flip_lr/version_18/checkpoints/epoch=15-best_addval/add01d_acc=40.827.ckpt')
     parser.add_argument('--config', default='config/config.yaml')
     parser.add_argument('--dataset_root', default='filesOfOryon/data', help='Path to dataset root')
     args = parser.parse_args()

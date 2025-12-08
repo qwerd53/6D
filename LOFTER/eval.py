@@ -22,7 +22,7 @@ def get_dataset_args_dict(dataset_name: str, root_path: str, seed: int = 42):
     return {
         'dataset': {
             'root': root_path,
-            'img_size': [384, 384],
+            'img_size': [480, 640],
             'max_corrs': 4,
             'train': {'name': name, 'split': 'train', 'obj': obj_id},
             'test': {'name': name, 'split': 'val', 'obj': obj_id}

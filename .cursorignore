@@ -3,6 +3,7 @@
 weights/
 backup/
 filesOfOryon/data/
+TALK2DINO/
 *.zip
 *.tar
 *.tar.gz

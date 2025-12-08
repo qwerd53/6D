@@ -43,28 +43,98 @@ class DINOV2BackboneWithAttn(nn.Module):
             self.attn_maps.append(attn.detach())
         return hook
 
+   #@torch.no_grad()
+    @torch.no_grad()
     @torch.no_grad()
     def forward_features_and_attn(self, img: torch.Tensor):
         """
-        img: [B,3,H,W] normalized
+        完全防止 hub DINOv2 自动 resize 的版本
+        img: [B,3,H,W]，float32，range [0,1] 或 [-1,1]
         returns:
-          - feat_map: [B,C,Hf,Wf]
-          - attn_maps_proc: list of [B,num_heads,Hf,Wf]
+            feat_map: [B, C, Hf, Wf]
+            attn_maps_proc: list of [B, num_heads, Hf, Wf]
         """
-        self.attn_maps = []  # 清空上一次记录
+        self.attn_maps = []  # 清空之前的 attn
 
-        feat_map = self.model.forward_features(img)  # [B, C, Hf, Wf]
+        B_img, C_img, H_img, W_img = img.shape
 
-        # 处理 attention maps，去掉 cls token 并 reshape 成 [B, heads, Hf, Wf]
+        # ------------------------
+        # 1. patch embedding
+        # ------------------------
+        feat_out = self.model.forward_features(img)  # 不会自动 resize
+
+        # ------------------------
+        # 2. feat_map 处理
+        # ------------------------
+        if isinstance(feat_out, dict):
+            if "x_norm_patchtokens" in feat_out:
+                feat_map = feat_out["x_norm_patchtokens"]  # [B, N, C]
+            elif "last_hidden_state" in feat_out:
+                feat_map = feat_out["last_hidden_state"]
+            else:
+                raise ValueError(f"Unexpected keys in model output: {feat_out.keys()}")
+        else:
+            feat_map = feat_out
+
+        # ------------------------
+        # 3. reshape feat_map
+        # ------------------------
+        if feat_map.ndim == 4:  # 已经 [B,C,Hf,Wf]
+            Bf, Cf, Hf, Wf = feat_map.shape
+        elif feat_map.ndim == 3:  # [B, N, C] token
+            B, N, C = feat_map.shape
+
+            # 自动判断 CLS token
+            patch_size = getattr(getattr(self.model, 'patch_embed', None), 'patch_size', 14)
+            patch_size = patch_size if isinstance(patch_size, int) else int(patch_size[0])
+
+            # Hf/Wf 通过输入图像尺寸 + patch_size 计算
+            Hf = H_img // patch_size
+            Wf = W_img // patch_size
+            expected = Hf * Wf
+
+            if N == expected + 1:  # CLS token
+                feat_map = feat_map[:, 1:, :]
+            elif N != expected:
+                # 如果 token 数不匹配，直接按 sqrt(N) 强制 reshape
+                Hf = int(N ** 0.5)
+                Wf = N // Hf
+                if Hf * Wf != N:
+                    raise ValueError(f"[DINO] Cannot infer Hf/Wf from N={N}, input H,W=({H_img},{W_img})")
+                feat_map = feat_map
+
+            # reshape
+            feat_map = feat_map.permute(0, 2, 1).reshape(B, C, Hf, Wf)
+            Bf, Cf, Hf, Wf = feat_map.shape
+        else:
+            raise ValueError(f"[DINO] Unexpected feat_map shape: {feat_map.shape}")
+
+        # ------------------------
+        # 4. attention maps处理
+        # ------------------------
         attn_maps_proc = []
         for attn in self.attn_maps:
-            B, H, N, _ = attn.shape
-            patch_attn = attn[:, :, 0, 1:]  # 去掉 cls token
-            size = int((N - 1) ** 0.5)      # N_patches = N-1
-            patch_attn = patch_attn.view(B, H, size, size)
+            if attn.ndim == 3:  # [B,N,N] -> 1 head
+                attn = attn.unsqueeze(1)
+
+            B_attn, H_heads, N1, N2 = attn.shape
+            assert B_attn == Bf, f"attn batch {B_attn} != feat batch {Bf}"
+
+            # 去掉 cls token 列
+            if N2 == Hf * Wf + 1:
+                patch_attn = attn[:, :, 0, 1:]
+            elif N2 == Hf * Wf:
+                patch_attn = attn[:, :, 0, :]
+            elif N2 > Hf * Wf:
+                patch_attn = attn[:, :, 0, :Hf * Wf]
+            else:
+                raise ValueError(f"[DINO] attn tokens {N2} != expected {Hf * Wf} (Hf={Hf},Wf={Wf})")
+
+            patch_attn = patch_attn.view(Bf, H_heads, Hf, Wf)
             attn_maps_proc.append(patch_attn)
 
         return feat_map, attn_maps_proc
+
 
 class Talk2DINO:
     """
@@ -91,7 +161,6 @@ class Talk2DINO:
         # DINOv2 backbone + attention
         self.dino = DINOV2BackboneWithAttn(self.device)
 
-
     @torch.no_grad()
     def project_text(self, texts):
         """
@@ -107,8 +176,16 @@ class Talk2DINO:
                 flattened_texts.append(str(t))
 
         # 使用自定义 tokenizer
-        tokens = self.tokenizer(flattened_texts).to(self.device)  # context_length 默认为 77，可修改
+        tokens = self.tokenizer(flattened_texts)  # [B, context_length]
+
+        # 确保 tokens 在与 clip_model 相同的设备上
+        device = next(self.clip_model.parameters()).device
+        tokens = tokens.to(device)
+
+        # 编码文本
         clip_feat = self.clip_model.encode_text(tokens)
+
+        # 投影
         proj_feat = self.proj.project_clip_txt(clip_feat)
         return proj_feat
 

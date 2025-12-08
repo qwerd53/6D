@@ -86,6 +86,47 @@ class CLIPEncoder(nn.Module):
         x = rearrange(x, '(B T) D -> B T D', B=B,T=T)
 
         return x
+    # def encode_prompt(self, prompts: List[List[str]]) -> Tensor:
+    #     """
+    #     兼容多模板和单模板的 encode_prompt：
+    #     - 若 prompts[i] 是含多个字符串的列表，按原逻辑去掉第一个模板；
+    #     - 若 prompts[i] 只有一个字符串，则保留它。
+    #     """
+    #     processed_prompts = []
+    #     for prompt_list in prompts:
+    #         # ✅ 兼容：如果是空列表或只有一个元素，则直接使用它
+    #         if not isinstance(prompt_list, (list, tuple)):
+    #             # 防止上游传进来的是 str 而不是 list
+    #             processed_prompts.append([prompt_list])
+    #         elif len(prompt_list) > 1:
+    #             processed_prompts.append(prompt_list[1:])  # 原逻辑
+    #         else:
+    #             processed_prompts.append(prompt_list)  # 只有一个模板时不裁剪
+    #
+    #     # ✅ Tokenize：确保输出维度始终是 [B, T, L]
+    #     tokenized_text_list = [self.tokenizer(prompt) for prompt in processed_prompts]
+    #     tokenized_text = torch.stack(tokenized_text_list)  # -> [B, T, L] 或 [B, 1, L]
+    #     tokenized_text = tokenized_text.to(self.device)
+    #
+    #     # ✅ 统一处理
+    #     B, T = tokenized_text.shape[:2]
+    #     tokenized_text = rearrange(tokenized_text, 'B T L -> (B T) L', B=B, T=T)
+    #
+    #     # === 原始 encode 流程 ===
+    #     x = self.clip_model.token_embedding(tokenized_text).type(self.clip_model.dtype)
+    #     x = x + self.clip_model.positional_embedding.type(self.clip_model.dtype)
+    #     x = x.permute(1, 0, 2)
+    #     x = self.clip_model.transformer(x)
+    #     x = x.permute(1, 0, 2)
+    #     x = self.clip_model.ln_final(x).type(self.clip_model.dtype)
+    #
+    #     eof = tokenized_text.argmax(dim=-1)
+    #     x = x[torch.arange(x.shape[0]), eof]
+    #     x = x @ self.clip_model.text_projection
+    #     x = rearrange(x, '(B T) D -> B T D', B=B, T=T)
+    #
+    #     return x
+
     # def encode_prompt(self, prompts : List[List[str]]) -> Tensor:
     #     '''
     #     同时支持两种输入格式：
