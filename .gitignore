@@ -13,6 +13,8 @@ debug_masks/
 debug_point_cloud_reg/
 debug_registration_vis/
 debug_vis/
+vis_pairs/
+tempObjectMatching/
 *.zip
 *.tar
 *.tar.gz
