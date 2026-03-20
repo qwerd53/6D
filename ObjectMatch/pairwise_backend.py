@@ -529,7 +529,7 @@ class PairwiseVisualizer:
         pred_pose: np.ndarray,
         gn_output: GNOutput,
         extra_outputs: Optional[OptimExtraOutputs] = None,
-        asset_root: str = './assets/',
+        asset_root: str = './ObjectMatch/assets/',
         depth_trunc: float = 6.,
         filter_depth: bool = False,
         clean_mesh: bool = False,
@@ -542,7 +542,9 @@ class PairwiseVisualizer:
         self._dump_registration(
             output_dir, record0, record1, pred_pose, depth_trunc, filter_depth, clean_mesh
         )
-        self._dump_cameras(output_dir, pred_pose, asset_root)
+
+        #self._dump_cameras(output_dir, pred_pose, asset_root)
+
         self._dump_objects(output_dir, gn_output, asset_root)
         if extra_outputs is not None:
             self._dump_extras(output_dir, record0, record1, extra_outputs)

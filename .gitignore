@@ -3,6 +3,16 @@
 weights/
 backup/
 filesOfOryon/data/
+debug_boundingbox_vis/
+debug_boundingbox_vis_toyl/
+debug_boundingbox_vis_ycbv
+debug_feature_tsne/
+debug_loftr/
+debug_mask_guided_comparison/
+debug_masks/
+debug_point_cloud_reg/
+debug_registration_vis/
+debug_vis/
 *.zip
 *.tar
 *.tar.gz

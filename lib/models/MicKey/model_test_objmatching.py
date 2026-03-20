@@ -1,21 +1,6 @@
-"""
-集成 ObjectMatch 的测试代码
-将 LoFTR + Kabsch 替换为 ObjectMatch 的完整配准流程
-"""
-
 import torch
 import pytorch_lightning as pl
-import numpy as np
-import os
-import sys
 
-# 添加 ObjectMatch 路径
-#sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'ObjectMatch'))
-
-# ObjectMatch 导入
-from ObjectMatch.objectmatch_simple import ObjectMatch
-
-# 原有导入
 from lib.models.MicKey.modules.loss.loss_class import MetricPoseLoss
 from lib.models.MicKey.modules.compute_correspondences import ComputeCorrespondences
 from lib.models.MicKey.modules.utils.training_utils import log_image_matches, debug_reward_matches_log, vis_inliers, \
@@ -25,7 +10,6 @@ from lib.models.MicKey.modules.utils.probabilisticProcrustes import e2eProbabili
 from lib.utils.metrics import pose_error_torch, vcre_torch
 from lib.benchmarks.utils import precision_recall
 from lib.models.Oryon.oryon import Oryon
-
 # metric
 from filesOfOryon.bop_toolkit_lib.pose_error import my_mssd, my_mspd, vsd
 from filesOfOryon.bop_toolkit_lib.renderer_vispy import RendererVispy
@@ -33,24 +17,69 @@ from filesOfOryon.utils.pcd import get_diameter
 
 import matplotlib.pyplot as plt
 import pandas as pd
+import numpy as np
 from collections import defaultdict
+import os
+import cv2
 
+import numpy as np
+# -*- coding: utf-8 -*-
+import os
+import sys
+import math
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import pytorch_lightning as pl
 from filesOfOryon.bop_toolkit_lib.misc import format_sym_set
+import numpy as np
 from omegaconf import OmegaConf
 
-from filesOfOryon.utils.metrics import compute_add, compute_adds
-from filesOfOryon.utils.geo6d import best_fit_transform_with_RANSAC
+# ==== 外部依赖 ====
+from lib.models.Oryon.oryon import Oryon
+
+# ==== ObjectMatch 集成 ====
+try:
+    from ObjectMatch.pairwise_backend import (
+        KPConfig,
+        NOCPredConfig,
+        ObjectIDConfig,
+        OptimConfig,
+        PairwiseSolver,
+    )
+
+    OBJECTMATCH_AVAILABLE = True
+except ImportError:
+    print("Warning: ObjectMatch not available, will use LoFTR/SIFT only")
+    OBJECTMATCH_AVAILABLE = False
+
+import tempfile
+import shutil
+from PIL import Image
+
+# LoFTR
+from LOFTER.src.loftr import LoFTR, default_cfg
+
+# 你工程内已有的工具
+from lib.utils.metrics import pose_error_torch  # 仅用于可选对齐检查（未用于loss）
+from lib.benchmarks.utils import precision_recall  # 日志需要的话可以继续用
+from filesOfOryon.utils.metrics import compute_add, compute_adds  # 用于 ADD/ADD-S
+from filesOfOryon.utils.geo6d import best_fit_transform_with_RANSAC  # 可选的RANSAC
+# from filesOfOryon.utils.pointdsc.init import get_pointdsc_pose, get_pointdsc_solver  # 如需PointDSC就打开
 from filesOfOryon.utils.losses import DiceLoss, LovaszLoss, FocalLoss
 
 
+# from lib.models.MicKey.debug_loftr import debug_loftr
+# =========================
+#   MicKeyTrainingModel
+# =========================
 class MicKeyTrainingModel(pl.LightningModule):
     """
-    集成 ObjectMatch 的训练模型
-    - 使用 Oryon 产生 mask
-    - 使用 ObjectMatch 进行完整的配准流程（SuperGlue + 姿态估计）
-    - 保留原有的损失函数和评估指标
+    精简后的训练模型：
+    - 仅保留 Oryon 产生 mask 的模块
+    - LoFTR 进行匹配 + 掩码过滤 + 回投影 → Kabsch 求姿态
+    - 损失：mask_loss（BCEWithLogits） + compute_pose_loss（rot_angle + trans_l1，可选tanh clipping）
+    - 每半个 epoch 跑一次 ADD(S)-0.1D 评估并记录到 TensorBoard
     """
 
     def __init__(self, cfg):
@@ -61,36 +90,38 @@ class MicKeyTrainingModel(pl.LightningModule):
         # ---------- Oryon ----------
         self.oryon_model = Oryon(cfg, device='cuda' if torch.cuda.is_available() else 'cpu')
 
-
-        # ---------- ObjectMatch ----------
-        # 初始化 ObjectMatch（替代 LoFTR）
-        objectmatch_cfg = getattr(cfg, 'OBJECTMATCH', {})
-        self.objectmatch = ObjectMatch(
-            checkpoint_dir=getattr(objectmatch_cfg, 'CHECKPOINT_DIR', 'ObjectMatch/checkpoints'),
-            superglue_dir=getattr(objectmatch_cfg, 'SUPERGLUE_DIR', 'ObjectMatch/SuperGluePretrainedNetwork'),
-            superglue_model=getattr(objectmatch_cfg, 'MODEL', 'indoor'),
-            match_cache_dir=getattr(objectmatch_cfg, 'CACHE_DIR', './dump_features'),
-            verbose=False,  # 训练时关闭详细输出
-        )
-        # LoFTR
-        from LOFTER.src.loftr import LoFTR, default_cfg
-        # LoFTR matcher
-        default_cfg['coarse']['temp_bug_fix'] = False
-        self.matcher = LoFTR(config=default_cfg)
-        self.matcher.load_state_dict(torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict'])
-        self.matcher = self.matcher.eval().cuda()
-        print("Using LoFTR for 2D keypoint matching")
+        # ---------- Matcher Selection ----------
+        # self.use_sift = getattr(getattr(cfg, 'MATCHER', {}), 'USE_SIFT', False)
+        self.use_sift = False
+        if self.use_sift:
+            # SIFT matcher (no weights needed)
+            self.matcher = LoFTR(config=default_cfg)  # SIFT doesn't need a model
+            self.matcher.load_state_dict(torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict'])
+            self.matcher = self.matcher.eval()
+            print("Using SIFT for 2D keypoint matching")
+        else:
+            # LoFTR matcher
+            default_cfg['coarse']['temp_bug_fix'] = False
+            self.matcher = LoFTR(config=default_cfg)
+            self.matcher.load_state_dict(torch.load("LOFTER/weights/outdoor_ds.ckpt")['state_dict'])
+            self.matcher = self.matcher.eval()
+            print("Using LoFTR for 2D keypoint matching")
 
         # ---------- 损失 ----------
+        # self._mask_loss = nn.BCEWithLogitsLoss(reduction='mean')  # 用 logits
         self._mask_loss = DiceLoss(weight=torch.tensor([0.5, 0.5]))
         self.mask_th = getattr(getattr(cfg, 'LOSS', {}), 'MASK_TH', 0.5)
         self.soft_clip = getattr(getattr(cfg, 'LOSS', {}), 'SOFT_CLIP', True)
 
         # ---------- 训练控制 ----------
-        self.automatic_optimization = True
+        self.automatic_optimization = True  # Lightning 自动优化
         self.multi_gpu = True
         self.validation_step_outputs = []
         self.log_interval = getattr(cfg.TRAINING, 'LOG_INTERVAL', 50)
+
+        # 半 epoch 评估控制
+        self._ran_half_eval_for_epoch = False
+        self._half_epoch_batch_idx = None  # 每个 epoch 开头计算
 
         # VSD渲染器
         self.compute_vsd = True
@@ -101,38 +132,70 @@ class MicKeyTrainingModel(pl.LightningModule):
         self._vsd_objects_loaded = False
 
         # 初始化指标记录
+        self.validation_step_outputs = []
         self.test_step_outputs = []
 
-        self.useGTmask = True
-        self.debug_objectmatch_flag = False
+        self.useGTmask = False
+
+        self.debug_loftr_flag = False  # 调试开关
+        self.top_k_matches = 0  # for lm and toyl
+        if (self.top_k_matches == 0):
+            print("all valid points to 3d")
+        else:
+            print("top conf_valid points to 3d num:", self.top_k_matches)
+
+        # ==== ObjectMatch 初始化 ====
+        self.use_objectmatch = True
+        self.objectmatch_solver = None  # 延迟初始化，避免多GPU设备冲突
+
+        if self.use_objectmatch and not OBJECTMATCH_AVAILABLE:
+            print("Warning: ObjectMatch requested but not available, falling back to LoFTR/SIFT")
+            self.use_objectmatch = False
 
     def _load_vsd_objects(self):
         if self._vsd_objects_loaded:
             return
+
+        # 从 datamodule 获取所有 obj 信息
         obj_models, obj_diams, obj_symms = self.trainer.datamodule.val_dataloader().dataset.get_object_info()
         self.add_object_info(obj_models, obj_diams, obj_symms)
         self._vsd_objects_loaded = True
+
         print("Loaded VSD objects:", list(self.vsd_renderer.model_bbox_corners.keys()))
 
     def forward(self, batch):
         return self.forward_once(batch)
 
     # -------------------------
-    #   损失函数（保持不变）
+    #   = = = 关键 Loss = = =
     # -------------------------
     def mask_loss(self, pred_logits: torch.Tensor, gt: torch.Tensor):
-        """掩码损失"""
+        """
+        pred_logits: [B,1,H_pred,W_pred] — 掩码 logits
+        gt:          [B,H_gt,W_gt]       — ground truth binary mask
+
+        返回: loss, pred_mask(0/1), pred_logits, IoU
+        """
+        # print("(pred.shape:",pred_logits.shape)
+        # print("(gt.shape:",gt.shape)
+        # if pred_logits.dim() == 3:
+        #     pred =pred_logits.unsqueeze(1)  # [B, 1, H, W]
+        # if gt.dim() == 3:
+        #     gt = gt.unsqueeze(1)  # [B, 1, H, W]
+
+        # pred_logits.shape)
         gt_shape = gt.shape[1:]
         pred_shape = pred_logits.shape[2:]
+        # print("pred_shape", pred_shape)
+        # print("gt_shape", gt_shape)
         gt_c = gt.clone().to(torch.float32)
-
         if gt_shape != pred_shape:
             gt_c = F.interpolate(gt.unsqueeze(1), size=pred_shape, mode='nearest').squeeze(1)
 
         if gt_c.max() > 1.0:
             gt_c = gt_c / 255.0
 
-        logits = pred_logits.squeeze(1)
+        logits = pred_logits.squeeze(1)  # [B, H, W]
         loss = self._mask_loss(logits, gt_c.to(torch.float32))
 
         with torch.no_grad():
@@ -144,9 +207,15 @@ class MicKeyTrainingModel(pl.LightningModule):
         return loss, pred_mask, logits, iou
 
     def compute_pose_loss(self, R, t, Rgt_i, tgt_i, soft_clipping=True):
-        """姿态损失"""
-        loss_rot, _ = self.rot_angle_loss(R, Rgt_i)
-        loss_trans = self.trans_l1_loss(t, tgt_i)
+        """
+        与你给的 compute_pose_loss 一致：rot_angle_loss + trans_l1_loss（可 tanh soft clipping）
+        R:    [B,3,3]
+        t:    [B,1,3]
+        Rgt:  [B,3,3]
+        tgt:  [B,1,3]
+        """
+        loss_rot, _ = self.rot_angle_loss(R, Rgt_i)  # [B,1]
+        loss_trans = self.trans_l1_loss(t, tgt_i)  # [B,1,3] -> [B,1]
 
         if soft_clipping:
             loss_trans_soft = torch.tanh(loss_trans / 0.9)
@@ -157,9 +226,10 @@ class MicKeyTrainingModel(pl.LightningModule):
 
         return loss.mean(), loss_rot.mean(), loss_trans.mean()
 
+    # ---- 工具函数 ----
     @staticmethod
     def trans_l1_loss(t, tgt):
-        return torch.abs(t - tgt).sum(-1)
+        return torch.abs(t - tgt).sum(-1)  # [B,1,3] -> [B,1]
 
     @staticmethod
     def rot_angle_loss(R, Rgt):
@@ -172,59 +242,673 @@ class MicKeyTrainingModel(pl.LightningModule):
         return loss, R_err
 
     # -------------------------
-    #   核心前向传播（集成 ObjectMatch）
+    #     LoFTR + 后端求姿态
+    # -------------------------
+    @staticmethod
+    def rgb_to_gray(tensor_rgb: torch.Tensor) -> torch.Tensor:
+        gray = (0.2989 * tensor_rgb[:, 0, :, :] +
+                0.5870 * tensor_rgb[:, 1, :, :] +
+                0.1140 * tensor_rgb[:, 2, :, :])
+        return gray.unsqueeze(1)
+
+    def match_with_sift(self, img0_gray, img1_gray, mask0=None, mask1=None):
+        """
+        使用 SIFT 进行特征匹配
+        img0_gray, img1_gray: [1, 1, H, W] torch tensor (0~1)
+        mask0, mask1: [H, W] numpy array (optional)
+        返回: mkpts0, mkpts1, mconf (numpy arrays)
+        """
+        import cv2
+
+        # 转换为 uint8 格式
+        img0_np = (img0_gray.squeeze().cpu().numpy() * 255).astype(np.uint8)
+        img1_np = (img1_gray.squeeze().cpu().numpy() * 255).astype(np.uint8)
+
+        # 创建 SIFT 检测器
+        sift = cv2.SIFT_create(nfeatures=2000)
+
+        # 检测关键点和描述符
+        if mask0 is not None:
+            mask0_uint8 = (mask0 * 255).astype(np.uint8)
+            kp0, des0 = sift.detectAndCompute(img0_np, mask=mask0_uint8)
+        else:
+            kp0, des0 = sift.detectAndCompute(img0_np, None)
+
+        if mask1 is not None:
+            mask1_uint8 = (mask1 * 255).astype(np.uint8)
+            kp1, des1 = sift.detectAndCompute(img1_np, mask=mask1_uint8)
+        else:
+            kp1, des1 = sift.detectAndCompute(img1_np, None)
+
+        # 如果没有检测到特征点
+        if des0 is None or des1 is None or len(kp0) < 2 or len(kp1) < 2:
+            return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0)
+
+        # 使用 BFMatcher 进行匹配
+        bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+        matches = bf.knnMatch(des0, des1, k=2)
+
+        # Lowe's ratio test
+        good_matches = []
+        for match_pair in matches:
+            if len(match_pair) == 2:
+                m, n = match_pair
+                if m.distance < 0.75 * n.distance:
+                    good_matches.append(m)
+
+        if len(good_matches) == 0:
+            return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0)
+
+        # 提取匹配点坐标
+        mkpts0 = np.float32([kp0[m.queryIdx].pt for m in good_matches])
+        mkpts1 = np.float32([kp1[m.trainIdx].pt for m in good_matches])
+
+        # 计算置信度（使用距离的倒数归一化）
+        distances = np.array([m.distance for m in good_matches])
+        mconf = 1.0 / (1.0 + distances / 100.0)  # 归一化到 0~1
+
+        return mkpts0, mkpts1, mconf
+
+    @staticmethod
+    def adjust_intrinsics_for_resize(K, original_size=(640, 480), current_size=(640, 480)):
+        """K: [3,3],  size:(width,height)"""
+        original_width, original_height = original_size
+        current_width, current_height = current_size
+        scale_x = current_width / original_width
+        scale_y = current_height / original_height
+        K_adj = K.copy()
+        K_adj[0, 0] *= scale_x
+        K_adj[0, 2] *= scale_x
+        K_adj[1, 1] *= scale_y
+        K_adj[1, 2] *= scale_y
+        return K_adj
+
+    @staticmethod
+    def backproject(kpts, depth, K):
+        """
+        kpts: [N,2] (x,y), depth:[H,W], K:[3,3]
+        return: pts3d_full:[N,3] (NaN填充), valid_mask:[N]
+        """
+        N = len(kpts)
+        pts3d_full = np.full((N, 3), np.nan, dtype=np.float32)
+
+        x, y = kpts[:, 0], kpts[:, 1]
+        x_int, y_int = x.round().astype(int), y.round().astype(int)
+        valid_xy = (x_int >= 0) & (x_int < depth.shape[1]) & (y_int >= 0) & (y_int < depth.shape[0])
+
+        x_int_valid, y_int_valid = x_int[valid_xy], y_int[valid_xy]
+        x_valid, y_valid = x[valid_xy], y[valid_xy]
+        z = depth[y_int_valid, x_int_valid]
+        valid_z = z > 0
+        final_valid_idx = np.where(valid_xy)[0][valid_z]
+
+        x, y, z = x_valid[valid_z], y_valid[valid_z], z[valid_z]
+        pts = np.linalg.inv(K) @ np.vstack([x * z, y * z, z])
+        pts3d_full[final_valid_idx] = pts.T
+
+        final_valid_mask = np.zeros(N, dtype=bool)
+        final_valid_mask[final_valid_idx] = True
+        return pts3d_full, final_valid_mask
+
+    @staticmethod
+    def kabsch_umeyama(A, B):
+        assert A.shape == B.shape
+        centroid_A = np.mean(A, axis=0)
+        centroid_B = np.mean(B, axis=0)
+        AA = A - centroid_A
+        BB = B - centroid_B
+        H = AA.T @ BB
+        U, S, Vt = np.linalg.svd(H)
+        R_ = Vt.T @ U.T
+        if np.linalg.det(R_) < 0:
+            Vt[-1, :] *= -1
+            R_ = Vt.T @ U.T
+        t_ = centroid_B - R_ @ centroid_A
+        return R_, t_
+
+    def prepare_objectmatch_data(self, batch, idx):
+        """
+        准备 ObjectMatch 所需的数据格式
+        按照 ObjectMatch 期望的目录结构组织文件：
+        scene_xxx/
+          ├── color/
+          │   ├── 0.png
+          │   └── 1.png
+          ├── depth/
+          │   ├── 0.png
+          │   └── 1.png
+          ├── label/
+          │   ├── 0.png
+          │   └── 1.png
+          ├── intrinsic_depth.txt
+          └── intrinsic_color.txt
+        """
+        # ✅ 使用固定的项目目录而不是系统临时目录
+        import time
+        temp_base = os.path.abspath(os.path.join(".", "tempObjectMatching"))
+        os.makedirs(temp_base, exist_ok=True)
+
+        # ✅ 使用时间戳创建唯一的 scene 目录
+        timestamp = int(time.time() * 1000000) % 1000000
+        scene_name = f"scene_{timestamp}_{idx}"
+        temp_dir = os.path.join(temp_base, scene_name)
+        os.makedirs(temp_dir, exist_ok=True)
+        color_dir = os.path.join(temp_dir, "color")
+        depth_dir = os.path.join(temp_dir, "depth")
+        label_dir = os.path.join(temp_dir, "label")
+
+        os.makedirs(color_dir, exist_ok=True)
+        os.makedirs(depth_dir, exist_ok=True)
+        os.makedirs(label_dir, exist_ok=True)
+
+        # 获取 mask（GT 或预测）
+        if self.useGTmask:
+            mask0 = batch['mask0_gt'][idx].cpu().numpy()  # [H, W]
+            mask1 = batch['mask1_gt'][idx].cpu().numpy()
+        else:
+            # 使用预测的 mask (需要先运行 Oryon)
+            mask0 = batch['pred_mask0'][idx].cpu().numpy()
+            mask1 = batch['pred_mask1'][idx].cpu().numpy()
+
+        # 转换 mask 为 3 通道用于图像过滤
+        mask0_3ch = np.stack([mask0, mask0, mask0], axis=-1)  # [H, W, 3]
+        mask1_3ch = np.stack([mask1, mask1, mask1], axis=-1)
+
+        # 获取原始 RGB 图像并转换为 numpy (0-255)
+        img0_np = (batch['image0'][idx].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+        img1_np = (batch['image1'][idx].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+
+        # 用 mask 将背景置黑（保留前景）
+        img0_masked = (img0_np * mask0_3ch).astype(np.uint8)
+        img1_masked = (img1_np * mask1_3ch).astype(np.uint8)
+
+        # 保存掩码后的 RGB 图像到 color/ 目录
+        img0_path = os.path.join(color_dir, "0.png")
+        img1_path = os.path.join(color_dir, "1.png")
+        Image.fromarray(img0_masked).save(img0_path)
+        Image.fromarray(img1_masked).save(img1_path)
+
+        # 保存深度图到 depth/ 目录 (ObjectMatch 期望单位是 mm)
+        depth0_path = os.path.join(depth_dir, "0.png")
+        depth1_path = os.path.join(depth_dir, "1.png")
+
+        depth0_np = batch['depth0'][idx].cpu().numpy()
+        depth1_np = batch['depth1'][idx].cpu().numpy()
+        depth0_np = depth0_np.astype(np.uint16)
+        depth1_np = depth1_np.astype(np.uint16)
+        # ✅ 检查并修复深度单位
+        # ObjectMatch 期望深度单位是 mm
+        depth0_max = depth0_np[depth0_np > 0].max() if np.count_nonzero(depth0_np) > 0 else 0
+
+        # if depth0_max < 100:  # 可能是米 (m)
+        #     print(f"⚠️ Depth seems to be in meters (max={depth0_max:.2f}), converting to mm")
+        #     depth0_np = (depth0_np * 1000).astype(np.uint16)
+        #     depth1_np = (depth1_np * 1000).astype(np.uint16)
+        # elif depth0_max > 100000:  # 可能是微米 (μm)
+        #     print(f"⚠️ Depth seems to be in micrometers (max={depth0_max:.0f}), converting to mm")
+        #     depth0_np = (depth0_np / 1000).astype(np.uint16)
+        #     depth1_np = (depth1_np / 1000).astype(np.uint16)
+        # else:  # 已经是 mm
+        #     depth0_np = depth0_np.astype(np.uint16)
+        #     depth1_np = depth1_np.astype(np.uint16)
+        if idx == 0:  # 只打印第一个样本
+            print(f"✅ Depth unit, max={depth0_max:.0f}")
+
+        Image.fromarray(depth0_np).save(depth0_path)
+        Image.fromarray(depth1_np).save(depth1_path)
+
+        # 保存 mask 到 label/ 目录 (二值图)
+        mask0_path = os.path.join(label_dir, "0.png")
+        mask1_path = os.path.join(label_dir, "1.png")
+        mask0_uint8 = (mask0 * 255).astype(np.uint8)
+        mask1_uint8 = (mask1 * 255).astype(np.uint8)
+        Image.fromarray(mask0_uint8).save(mask0_path)
+        Image.fromarray(mask1_uint8).save(mask1_path)
+
+        # 保存相机内参（4x4 格式）到根目录
+        K0 = batch['K_color0'][idx].cpu().numpy()  # [3, 3]
+        K1 = batch['K_color1'][idx].cpu().numpy()  # [3, 3]
+
+        # 转换为 4x4 矩阵
+        K0_4x4 = np.eye(4, dtype=np.float32)
+        K0_4x4[:3, :3] = K0
+        K1_4x4 = np.eye(4, dtype=np.float32)
+        K1_4x4[:3, :3] = K1
+
+        # ObjectMatch 期望的文件名（在根目录）
+        # 假设两个相机内参相同，使用 K0（或者可以取平均）
+        intrinsic_depth_path = os.path.join(temp_dir, "intrinsic_depth.txt")
+        intrinsic_color_path = os.path.join(temp_dir, "intrinsic_color.txt")
+
+        np.savetxt(intrinsic_depth_path, K0_4x4)
+        np.savetxt(intrinsic_color_path, K0_4x4)
+
+        # ✅ 打印保存的目录信息
+        print(f"\n📁 ObjectMatch Data Saved (batch_idx={idx}):")
+        print(f"   Scene Dir: {temp_dir}")
+        print(f"   Color: {os.path.basename(img0_path)}, {os.path.basename(img1_path)}")
+
+        return temp_base, img0_path, img1_path
+
+    def run_superglue_match(self, img0_path, img1_path, out_dir="ObjectMatch/dump_features"):
+        """
+        运行 SuperGlue 特征匹配（参照 ObjectMatching.py）
+        返回: match_data (npz 文件路径)
+        """
+        os.makedirs(out_dir, exist_ok=True)
+
+        # ✅ 提取 SuperGlue 实际命名规则
+        # SuperGlue 在 match_pairs_scannet.py 中查找以 "scene" 开头的路径部分
+        # 路径格式：/tmp/xxx/scene_yyy/color/0.png
+        path_parts = img0_path.replace('\\', '/').split('/')
+        scene = None
+        for part in path_parts:
+            if part.startswith('scene') or part.startswith('rgbd_dataset'):
+                scene = part
+                break
+
+        if scene is None:
+            raise RuntimeError(f"Cannot find scene name in path: {img0_path}")
+
+        frame0 = os.path.basename(img0_path).split('.')[0]
+        frame1 = os.path.basename(img1_path).split('.')[0]
+
+        # SuperGlue 生成的文件名格式：{scene}_{frame0}_{frame1}_matches.npz
+        basename = f"{scene}_{frame0}_{frame1}"
+        match_path = os.path.join(out_dir, f"{basename}_matches.npz")
+
+        # 如果已存在则直接返回
+        if os.path.isfile(match_path):
+            print(f"[SG] Load cached match: {match_path}")
+            return match_path
+
+        print("[SG] Running SuperGlue matching...")
+
+        # 创建临时配对文件（使用唯一名称避免并发冲突）
+        import time
+        temp_txt = f"temp_sg_{int(time.time() * 1000000) % 1000000}.txt"
+
+        try:
+            with open(temp_txt, "w") as f:
+                intr_flat = " ".join(["0"] * 9)
+                pose_dummy = " ".join(["0"] * 16)
+                f.write(f"{img0_path} {img1_path} 0 0 {intr_flat} {intr_flat} {pose_dummy}\n")
+
+            # 运行 SuperGlue（使用 os.system 以匹配 ObjectMatching.py）
+            cmd = (
+                f"{sys.executable} -u "
+                f"ObjectMatch/SuperGluePretrainedNetwork/match_pairs_scannet.py "
+                f"--input_dir '.' "
+                f"--input_pairs {temp_txt} "
+                f"--output_dir {out_dir}"
+            )
+
+            os.system(cmd)
+        finally:
+            # 确保清理临时文件
+            if os.path.exists(temp_txt):
+                try:
+                    os.unlink(temp_txt)
+                except Exception:
+                    pass
+
+        if not os.path.isfile(match_path):
+            raise RuntimeError(f"SuperGlue did not generate match file: {match_path}")
+
+        print(f"[SG] match saved to {match_path}")
+        return match_path
+
+    def run_objectmatch_pose(self, batch, idx):
+        """
+        使用 ObjectMatch 估计相对位姿
+        完全参照 ObjectMatching.py 的写法
+        GN 失败时返回单位矩阵
+        返回: R [3,3], t [3] (单位: m)
+        """
+        # 延迟初始化 ObjectMatch solver（确保在正确的设备上）
+        if self.objectmatch_solver is None:
+            device = batch['image0'].device
+            ckpt_noc = "ObjectMatch/checkpoints/model_sym.pth"
+            ckpt_objid = "ObjectMatch/checkpoints/all_5"
+
+            # ① 构建 ObjectMatch 求解器（参照 ObjectMatching.py）
+            self.objectmatch_solver = PairwiseSolver(
+                KPConfig(),
+                NOCPredConfig(ckpt_noc, "configs/NOCPred.yaml"),
+                ObjectIDConfig(ckpt_objid),
+                OptimConfig(verbose=True),  # 启用 verbose 以便调试
+            )
+            # Move NOC predictor to the correct device
+            self.objectmatch_solver.noc_pred.model = self.objectmatch_solver.noc_pred.model.to(device)
+
+        try:
+            # ② 准备数据（生成临时目录结构）
+            temp_dir, img0_path, img1_path = self.prepare_objectmatch_data(batch, idx)
+
+            # ③ 读取 RGB + 深度 + mask + NOCS（ObjectMatch 的标准数据结构）
+            record0 = self.objectmatch_solver.load_record(img0_path)
+            record1 = self.objectmatch_solver.load_record(img1_path)
+
+            if record0 is None or record1 is None:
+                print("⚠️ load_record failed, returning identity pose")
+                return np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+
+            # ④ SuperGlue 匹配
+            match_path = self.run_superglue_match(img0_path, img1_path)
+            match_data = np.load(match_path)
+
+            print("Running ObjectMatch GN optimization...")
+
+            # ⑤ GN 优化求解 6D 位姿（参照 ObjectMatching.py 的调用方式）
+            pred_pose, gn_output, extras = self.objectmatch_solver(
+                record0,
+                record1,
+                match_data=match_data,
+                ret_extra_outputs=True
+            )
+            pred_pose=np.linalg.inv(pred_pose)
+            # 检查返回值
+            if pred_pose is None:
+                print("⚠️ ObjectMatch returned None, using identity pose")
+                return np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+
+            print("\nPredicted Pose (T_0_to_1):")
+            print(pred_pose)
+
+            print("\nGT Pose (T_0_to_1):")
+            print(batch['pose'][idx])
+
+            # pred_pose 是 4x4 的相对位姿矩阵 (T_0_to_1)
+            R_rel = pred_pose[:3, :3]
+            t_rel = pred_pose[:3, 3]  # 单位应该是 m
+
+            # 清理临时文件（可选，调试时可以注释掉）
+            # shutil.rmtree(temp_dir, ignore_errors=True)
+
+            return R_rel, t_rel
+
+        except Exception as e:
+            print(f"⚠️ ObjectMatch failed with error: {e}")
+            print("   Returning identity pose (no transformation)")
+            # 返回单位矩阵表示失败
+            return np.eye(3, dtype=np.float32), np.zeros(3, dtype=np.float32)
+
+    # -------------------------
+    #         前向部分
     # -------------------------
     def forward_once(self, batch):
+        if self.debug_loftr_flag:
+            self.debug_loftr(batch)
+            print("debug finished...")
+            exit()
+
         """
-        使用 ObjectMatch 替代 LoFTR + Kabsch 的完整流程
+        单次前向（用于 train/val/eval）
         """
         device = batch['image0'].device
         B, _, H, W = batch['image0'].shape
 
-        # 1) Oryon 输出掩码
-        oryon_out = self.oryon_model.forward(batch)
-        pred_mask0_logits = oryon_out['mask_a']
-        pred_mask1_logits = oryon_out['mask_q']
+        # 1) Oryon 输出（假定返回 logits 形态）
+        oryon_out = self.oryon_model.forward(batch)  # 包含 'mask_a', 'mask_q'
+        pred_mask0_logits = oryon_out['mask_a']  # [B,1,Hm,Wm]
+        pred_mask1_logits = oryon_out['mask_q']  # [B,1,Hm,Wm]
 
-        # 2) 计算掩码损失
-        mask0_gt = batch['mask0_gt']
-        mask1_gt = batch['mask1_gt']
+        # 2) mask loss
+        mask0_gt = batch['mask0_gt']  # [B,H,W]
+        mask1_gt = batch['mask1_gt']  # [B,H,W]
 
-        if self.useGTmask:
-            mask0_gt_input = mask0_gt.unsqueeze(1)
-            mask1_gt_input = mask1_gt.unsqueeze(1)
-            mask0_loss, _, _, mask0_iou = self.mask_loss(mask0_gt_input, batch['mask0_gt'])
-            mask1_loss, _, _, mask1_iou = self.mask_loss(mask1_gt_input, batch['mask1_gt'])
+        # 2) mask loss
+        mask0_gt = batch['mask0_gt']  # [B,H,W]
+        mask1_gt = batch['mask1_gt']  # [B,H,W]
+
+        if (self.useGTmask):
+            mask0_gt = mask0_gt.unsqueeze(1)  # [B,1,H,W]
+            mask1_gt = mask1_gt.unsqueeze(1)  # [B,1,H,W]
+            mask0_loss, _, _, mask0_iou = self.mask_loss(mask0_gt, batch['mask0_gt'])
+            mask1_loss, _, _, mask1_iou = self.mask_loss(mask1_gt, batch['mask1_gt'])
         else:
             mask0_loss, _, _, mask0_iou = self.mask_loss(pred_mask0_logits, mask0_gt)
             mask1_loss, _, _, mask1_iou = self.mask_loss(pred_mask1_logits, mask1_gt)
-
         mask_loss_all = mask0_loss + mask1_loss
         mask_iou_mean = (mask0_iou + mask1_iou) / 2.
 
-        # 3) 使用 ObjectMatch 进行配准
+        # 3) logits -> 概率
+        pred_mask0_prob = torch.sigmoid(pred_mask0_logits).squeeze(1)  # [B,Hm,Wm]
+        pred_mask1_prob = torch.sigmoid(pred_mask1_logits).squeeze(1)  # [B,Hm,Wm]
+
+        # 4) resize 到输入图像大小
+        pred_mask0_prob = F.interpolate(pred_mask0_prob.unsqueeze(1),
+                                        size=(H, W), mode='bilinear',
+                                        align_corners=False).squeeze(1)
+        pred_mask1_prob = F.interpolate(pred_mask1_prob.unsqueeze(1),
+                                        size=(H, W), mode='bilinear',
+                                        align_corners=False).squeeze(1)
+
+        # 5) 二值化
+        pred_mask0_bin = (pred_mask0_prob > 0.5).float()
+        pred_mask1_bin = (pred_mask1_prob > 0.5).float()
+        # pred_mask0_bin = (pred_mask0_prob > 0.3).float()
+        # pred_mask1_bin = (pred_mask1_prob > 0.3).float()
+
+        # 5.5) 将预测的 mask 存入 batch，供 ObjectMatch 使用
+        if not self.useGTmask:
+            batch['pred_mask0'] = pred_mask0_bin
+            batch['pred_mask1'] = pred_mask1_bin
+
+        # 6) pred灰度图过滤
+        # img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
+        # img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
+
+        if (self.useGTmask):
+
+            ## 6) 灰度图过滤 - GT 掩码
+            img0_gray = self.rgb_to_gray(batch['image0']) * batch['mask0_gt'].unsqueeze(1)
+            img1_gray = self.rgb_to_gray(batch['image1']) * batch['mask1_gt'].unsqueeze(1)
+        else:
+            # pred灰度图过滤
+            img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
+            img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
+
+        # 7) 位姿估计 (ObjectMatch 或 LoFTR/SIFT + Kabsch)
         R_preds, t_preds = [], []
-
         for i in range(B):
-            # 准备单个样本的数据
-            sample_data = self._prepare_objectmatch_batch(batch, i)
+            # ==== 使用 ObjectMatch ====
+            if self.use_objectmatch:
+                R_rel, t_rel = self.run_objectmatch_pose(batch, i)
 
-            try:
-                # 调用 ObjectMatch 配准
-                result = self._run_objectmatch_registration(sample_data)
+                T_obj_in_cam0 = batch['item_a_pose'][i].detach().cpu().numpy()
+                T_obj_in_cam1_gt = batch['item_q_pose'][i].detach().cpu().numpy()
 
-                if result is not None:
-                    R_preds.append(result['R'])
-                    t_preds.append(result['t'])
+                T_rel_mat = np.eye(4, dtype=np.float32)
+                T_rel_mat[:3, :3] = R_rel
+                T_rel_mat[:3, 3] = t_rel
+
+                # ✅ 调试: 尝试所有可能的公式，找出正确的
+                if i == 0:  # 只打印第一个样本
+                    print("\n" + "=" * 60)
+                    print("ObjectMatch Coordinate System Debug")
+                    print("=" * 60)
+
+                    formulas = {
+                        "v1: T_rel @ T_obj_in_cam0": T_rel_mat @ T_obj_in_cam0,
+                        "v2: inv(T_rel) @ T_obj_in_cam0": np.linalg.inv(T_rel_mat) @ T_obj_in_cam0,
+                        "v3: T_obj_in_cam0 @ T_rel": T_obj_in_cam0 @ T_rel_mat,
+                        "v4: T_obj_in_cam0 @ inv(T_rel)": T_obj_in_cam0 @ np.linalg.inv(T_rel_mat),
+                    }
+
+                    best_formula = None
+                    best_error = float('inf')
+
+                    for name, T_pred in formulas.items():
+                        t_error = np.linalg.norm(T_pred[:3, 3] - T_obj_in_cam1_gt[:3, 3])
+                        R_diff = T_pred[:3, :3].T @ T_obj_in_cam1_gt[:3, :3]
+                        trace = np.clip(np.trace(R_diff), -1, 3)
+                        R_error = np.arccos((trace - 1) / 2) * 180 / np.pi
+
+                        total_error = t_error + R_error / 180.0  # 归一化
+
+                        #print(f"{name:30s}: t_err={t_error:.4f}m, R_err={R_error:.2f}°")
+
+                        if total_error < best_error:
+                            best_error = total_error
+                            best_formula = name
+
+                    print(f"\n✅ used formula: T_rel_mat @ T_obj_in_cam0")
+                    print("=" * 60 + "\n")
+
+                # ✅ 使用调试发现的最佳公式
+                # 注意：即使是最佳公式，误差仍然很大，说明 ObjectMatch 本身有问题
+                T_obj_in_cam1_pred = T_rel_mat @ T_obj_in_cam0
+                R_q = torch.from_numpy(T_obj_in_cam1_pred[:3, :3]).float().to(device)
+                t_q = torch.from_numpy(T_obj_in_cam1_pred[:3, 3]).float().to(device).unsqueeze(0)
+
+                R_preds.append(R_q)
+                t_preds.append(t_q)
+                continue
+
+            # ==== 使用 LoFTR/SIFT + Kabsch (原逻辑) ====
+            elif self.use_sift:
+                # 使用 SIFT 匹配
+                m0 = batch['mask0_gt'][i].detach().cpu().numpy() if self.useGTmask else pred_mask0_bin[
+                    i].detach().cpu().numpy()
+                m1 = batch['mask1_gt'][i].detach().cpu().numpy() if self.useGTmask else pred_mask1_bin[
+                    i].detach().cpu().numpy()
+
+                mkpts0, mkpts1, mconf = self.match_with_sift(
+                    img0_gray[i:i + 1],
+                    img1_gray[i:i + 1],
+                    mask0=m0,
+                    mask1=m1
+                )
+            else:
+                # 使用 LoFTR 匹配
+                match_batch = {'image0': img0_gray[i:i + 1], 'image1': img1_gray[i:i + 1]}
+                with torch.no_grad():
+                    self.matcher.eval()
+                    self.matcher(match_batch)
+
+                mkpts0 = match_batch['mkpts0_f'].detach().cpu().numpy()  # [N, 2]
+                mkpts1 = match_batch['mkpts1_f'].detach().cpu().numpy()  # [N, 2]
+                mconf = match_batch['mconf'].detach().cpu().numpy()  # [N]
+
+                # print("len(mkpts0 after matching:", len(mkpts0))
+
+                if (self.useGTmask):
+                    # if使用 GT 掩码
+                    m0 = batch['mask0_gt'][i].detach().cpu().numpy()  # ★
+                    m1 = batch['mask1_gt'][i].detach().cpu().numpy()  # ★
                 else:
-                    # 配准失败，使用单位矩阵
+                    # if pred mask
+                    m0 = pred_mask0_bin[i].detach().cpu().numpy()
+                    m1 = pred_mask1_bin[i].detach().cpu().numpy()
+
+                if len(mkpts0) == 0:
+                    print("error,len(mkpts0)<0 after loftr")
                     R_preds.append(torch.eye(3, device=device))
                     t_preds.append(torch.zeros(1, 3, device=device))
+                    continue
 
-            except Exception as e:
-                print(f"ObjectMatch 配准失败: {e}")
-                R_preds.append(torch.eye(3, device=device))
-                t_preds.append(torch.zeros(1, 3, device=device))
+                # # 按掩码过滤关键点
+                # in_mask = (m0[mkpts0[:, 1].round().astype(int),
+                # mkpts0[:, 0].round().astype(int)] > 0) & \
+                #           (m1[mkpts1[:, 1].round().astype(int),
+                #           mkpts1[:, 0].round().astype(int)] > 0)
+                # mkpts0 = mkpts0[in_mask]
+                # mkpts1 = mkpts1[in_mask]
+                #
+                # if len(mkpts0) < 3:
+                #     print("error,len(mkpts0)<3 after filtering")
+                #     R_preds.append(torch.eye(3, device=device))
+                #     t_preds.append(torch.zeros(1, 3, device=device))
+                #     continue
+
+                # ✅ 按掩码过滤关键点
+                in_mask = (m0[mkpts0[:, 1].round().astype(int),
+                mkpts0[:, 0].round().astype(int)] > 0) & \
+                          (m1[mkpts1[:, 1].round().astype(int),
+                          mkpts1[:, 0].round().astype(int)] > 0)
+
+                mkpts0 = mkpts0[in_mask]
+                mkpts1 = mkpts1[in_mask]
+                mconf = mconf[in_mask]  # ★ 同步过滤置信度
+                # print("len(mkpts0 after mask2d:", len(mkpts0))
+                # # ✅ 按置信度排序并取 Top-8
+                # if len(mkpts0) >= 8:
+                #     idx = np.argsort(-mconf)[:8]  # 从大到小
+                #     mkpts0 = mkpts0[idx]
+                #     mkpts1 = mkpts1[idx]
+                #     mconf = mconf[idx]  # 保持一致
+                # elif len(mkpts0) < 3:  # 仍不够用于Kabsch
+                #     print("error,len(mkpts0)<3 after 2nd filtering")
+                #     R_preds.append(torch.eye(3, device=device))
+                #     t_preds.append(torch.zeros(1, 3, device=device))
+                #     continue
+
+                # 根据 self.top_k_matches 控制是否取 Top-K 置信度匹配点
+                top_k = self.top_k_matches
+
+                if top_k is not None and top_k > 0:
+                    # 置信度排序
+                    if len(mkpts0) >= top_k:
+                        idx = np.argsort(-mconf)[:top_k]  # 取置信度最高 top_k 坐标
+                        mkpts0 = mkpts0[idx]
+                        mkpts1 = mkpts1[idx]
+                        mconf = mconf[idx]
+                    elif len(mkpts0) < 3:  # 仍然不够用于 Kabsch（至少需要3点）
+                        print(f"error: len(mkpts0)<3 after filtering, got {len(mkpts0)}")
+                        R_preds.append(torch.eye(3, device=device))
+                        t_preds.append(torch.zeros(1, 3, device=device))
+                        continue
+                else:
+                    # ✅ 不过滤
+                    if len(mkpts0) < 3:
+                        print(f"error: len(mkpts0)<3 (no filtering mode), got {len(mkpts0)}")
+                        R_preds.append(torch.eye(3, device=device))
+                        t_preds.append(torch.zeros(1, 3, device=device))
+                        continue
+
+                # 8) 回投影到 3D
+                depth0 = batch['depth0'][i].detach().cpu().numpy()  # /10.
+                depth1 = batch['depth1'][i].detach().cpu().numpy()  # /10.
+                # print("depth0:",depth0)
+                K0 = batch['K_color0'][i].detach().cpu().numpy()
+                K1 = batch['K_color1'][i].detach().cpu().numpy()
+
+                current_h, current_w = batch['image0'][i].shape[1:]
+                K0 = self.adjust_intrinsics_for_resize(K0, original_size=(640, 480),
+                                                       current_size=(current_w, current_h))
+                K1 = self.adjust_intrinsics_for_resize(K1, original_size=(640, 480),
+                                                       current_size=(current_w, current_h))
+
+                # print("K0",K0)
+                # print("K1", K1)
+                pts3d_0, valid0 = self.backproject(mkpts0, depth0, K0)
+                pts3d_1, valid1 = self.backproject(mkpts1, depth1, K1)
+                valid = valid0 & valid1
+                if np.count_nonzero(valid) < 3:
+                    R_preds.append(torch.eye(3, device=device))
+                    t_preds.append(torch.zeros(1, 3, device=device))
+                    continue
+
+                A = pts3d_0[valid]
+                Bp = pts3d_1[valid]
+
+                # 9) Kabsch
+                R_np, t_np = self.kabsch_umeyama(A, Bp)
+                # R_t = torch.from_numpy(R_np).float().to(device)
+                # t_t = torch.from_numpy(t_np).float().to(device).unsqueeze(0) / 1000.0
+
+                # 10) 转到绝对位姿
+                T_a = batch['item_a_pose'][i].detach().cpu().numpy()
+                T_rel = np.eye(4, dtype=np.float32)
+                T_rel[:3, :3] = R_np
+                T_rel[:3, 3] = (t_np / 1000.0)
+                T_q_pred = T_rel @ T_a
+                R_q = torch.from_numpy(T_q_pred[:3, :3]).float().to(device)
+                t_q = torch.from_numpy(T_q_pred[:3, 3]).float().to(device).unsqueeze(0)
+
+                R_preds.append(R_q)
+                t_preds.append(t_q)
 
         R_pred = torch.stack(R_preds, dim=0)
         t_pred = torch.stack(t_preds, dim=0)
@@ -238,101 +922,30 @@ class MicKeyTrainingModel(pl.LightningModule):
             'mask1_loss': mask1_loss,
         }
 
-    def _prepare_objectmatch_batch(self, batch, idx):
-        """
-        准备 ObjectMatch 需要的数据格式
-        """
-        # 保存临时图像文件（ObjectMatch 需要文件路径）
-        temp_dir = './temp_objectmatch'
-        os.makedirs(temp_dir, exist_ok=True)
-
-        # 转换图像格式并保存
-        img0 = batch['image0'][idx].cpu().numpy().transpose(1, 2, 0)
-        img1 = batch['image1'][idx].cpu().numpy().transpose(1, 2, 0)
-        img0 = (img0 * 255).astype(np.uint8)
-        img1 = (img1 * 255).astype(np.uint8)
-
-        from PIL import Image
-        img0_path = f'{temp_dir}/img0_{idx}.png'
-        img1_path = f'{temp_dir}/img1_{idx}.png'
-        Image.fromarray(img0).save(img0_path)
-        Image.fromarray(img1).save(img1_path)
-
-        # 保存深度图
-        depth0 = batch['depth0'][idx].cpu().numpy()
-        depth1 = batch['depth1'][idx].cpu().numpy()
-        np.save(f'{temp_dir}/depth0_{idx}.npy', depth0)
-        np.save(f'{temp_dir}/depth1_{idx}.npy', depth1)
-
-        # 准备内参和位姿
-        K0 = batch['K_color0'][idx].cpu().numpy()
-        K1 = batch['K_color1'][idx].cpu().numpy()
-        pose_a = batch['item_a_pose'][idx].cpu().numpy()
-        pose_q = batch['item_q_pose'][idx].cpu().numpy()
-
-        return {
-            'image0_path': img0_path,
-            'image1_path': img1_path,
-            'depth0': depth0,
-            'depth1': depth1,
-            'K0': K0,
-            'K1': K1,
-            'pose_a': pose_a,
-            'pose_q': pose_q,
-            'mask0': batch['mask0_gt'][idx].cpu().numpy() if self.useGTmask else None,
-            'mask1': batch['mask1_gt'][idx].cpu().numpy() if self.useGTmask else None,
-        }
-
-    def _run_objectmatch_registration(self, sample_data):
-        """
-        运行 ObjectMatch 配准
-        返回: {'R': [3,3], 't': [1,3]} 或 None
-        """
-        try:
-            # 使用 ObjectMatch 的 register 方法
-            result = self.objectmatch.register(
-                image0_path=sample_data['image0_path'],
-                image1_path=sample_data['image1_path'],
-                intrinsic0=sample_data['K0'],
-                intrinsic1=sample_data['K1'],
-                pose0=sample_data['pose_a'],
-                pose1=sample_data['pose_q'],
-                visualize=False,
-            )
-
-            if result.success:
-                # 提取旋转和平移
-                R = torch.from_numpy(result.camera_pose[:3, :3]).float().to(self.device)
-                t = torch.from_numpy(result.camera_pose[:3, 3]).float().to(self.device).unsqueeze(0)
-
-                return {'R': R, 't': t}
-            else:
-                return None
-
-        except Exception as e:
-            print(f"ObjectMatch 配准异常: {e}")
-            return None
-
     # -------------------------
-    #   训练步骤
+    #     Lightning Hooks
     # -------------------------
     def training_step(self, batch, batch_idx):
+        # 兼容你之前的自定义 collate 字段
         if 'pose' in batch and 'T_0to1' not in batch:
             batch['T_0to1'] = batch['pose']
 
+        # 前向 + 得到预测位姿
         out = self.forward_once(batch)
 
-        T_q_gt = batch['item_q_pose']
+        # GT 绝对位姿（query）
+        T_q_gt = batch['item_q_pose']  # [B,4,4]
         R_gt = T_q_gt[:, :3, :3]
-        t_gt = T_q_gt[:, :3, 3].unsqueeze(1)
+        t_gt = T_q_gt[:, :3, 3].unsqueeze(1)  # [B,1,3]，单位 m
 
+        # 姿态损失
         pose_loss, pose_rot_loss, pose_trans_loss = self.compute_pose_loss(
             out['R_pred'], out['t_pred'], R_gt, t_gt, soft_clipping=self.soft_clip
         )
 
         total_loss = out['mask_loss'] + pose_loss
 
-        # 日志
+        # ---- 日志 ----
         self.log('train/mask_loss', out['mask_loss'], prog_bar=True, on_step=True, on_epoch=True)
         self.log('train/mask_iou', out['mask_iou'], prog_bar=False, on_step=True, on_epoch=True)
         self.log('train/pose_loss', pose_loss, prog_bar=True, on_step=True, on_epoch=True)
@@ -340,12 +953,57 @@ class MicKeyTrainingModel(pl.LightningModule):
         self.log('train/pose_trans_loss', pose_trans_loss, prog_bar=False, on_step=True, on_epoch=True)
         self.log('train/total_loss', total_loss, prog_bar=True, on_step=True, on_epoch=True)
 
-        return total_loss
+        # ---- 半个 epoch 触发 ADD(S)-0.1D 评估 ----
+        if (self._half_epoch_batch_idx is not None
+                and batch_idx >= self._half_epoch_batch_idx
+                and not self._ran_half_eval_for_epoch):
+            self._ran_half_eval_for_epoch = True
+            with torch.no_grad():
+                add_acc = self.run_add01d_eval()
+            if add_acc is not None:
+                self.log('eval_half_epoch/add01d_acc(%)', add_acc, prog_bar=True, on_step=False, on_epoch=True)
 
+            return total_loss
+
+        # def on_train_epoch_start(self):
+
+    #     """在每个 epoch 开头确定“半个 epoch”的 batch 索引，并重置开关。"""
+    #     self._ran_half_eval_for_epoch = False
+    #     try:
+    #         # 估计本 epoch 的 train batch 数
+    #         train_loader = self.trainer.datamodule.train_dataloader()
+    #         n_batches = len(train_loader)
+    #         self._half_epoch_batch_idx = max(0, (n_batches // 2) - 1)
+    #     except Exception:
+    #         self._half_epoch_batch_idx = None
+
+    # def validation_step(self, batch, batch_idx):
+    #     out = self.forward_once(batch)
+    #
+    #     T_q_gt = batch['item_q_pose']
+    #     R_gt = T_q_gt[:, :3, :3]
+    #     t_gt = T_q_gt[:, :3, 3].unsqueeze(1)
+    #
+    #     pose_loss, pose_rot_loss, pose_trans_loss = self.compute_pose_loss(
+    #         out['R_pred'], out['t_pred'], R_gt, t_gt, soft_clipping=self.soft_clip
+    #     )
+    #     total_loss = out['mask_loss'] + pose_loss
+    #
+    #     logs = {
+    #         'loss': total_loss.detach(),
+    #         'pose_loss': pose_loss.detach(),
+    #         'pose_rot_loss': pose_rot_loss.detach(),
+    #         'pose_trans_loss': pose_trans_loss.detach(),
+    #         'mask_loss': out['mask_loss'].detach(),
+    #         'mask_iou': out['mask_iou'].detach(),
+    #     }
+    #     self.validation_step_outputs.append(logs)
+    #     return logs
     # -------------------------
-    #   验证步骤
+    #   Validation Step
     # -------------------------
     def validation_step(self, batch, batch_idx):
+        # 确保 VSD 对象已经加载
         self._load_vsd_objects()
 
         out = self.forward_once(batch)
@@ -367,10 +1025,13 @@ class MicKeyTrainingModel(pl.LightningModule):
 
         for i in range(len(batch['obj_id'])):
             obj_id = batch['obj_id'][i]
+
+            #  用初始化时保存的 obj 信息
             obj_model = self.obj_models[obj_id]
             obj_diam = self.obj_diams[obj_id]
             obj_sym = self.obj_symms[obj_id]
 
+            # 安全处理：如果 obj_id 不在 renderer 内，跳过 VSD
             if obj_id not in self.vsd_renderer.model_bbox_corners:
                 print(f"Warning: missing obj_id {obj_id} in renderer, skipping VSD")
                 vsd_err = 0.0
@@ -383,33 +1044,71 @@ class MicKeyTrainingModel(pl.LightningModule):
                 pred_pose[:3, 3] = out['t_pred'][i].squeeze()
 
                 gt_pose = batch['item_q_pose'][i]
+                # print(" pose_pred:", pred_pose)
+                # print(" pose_gt:", gt_pose)
 
+                # 转换为毫米
                 pred_R = pred_pose[:3, :3].cpu().numpy()
                 pred_t = (pred_pose[:3, 3] * 1000).cpu().numpy().reshape(3, 1)
                 gt_R = gt_pose[:3, :3].cpu().numpy()
                 gt_t = (gt_pose[:3, 3] * 1000).cpu().numpy().reshape(3, 1)
 
+                # print("gt_pose",gt_pose)
+                obj_sym = self.obj_symms.get(obj_id, None)
+                # 处理好的 ndarray
                 bop_sym = obj_sym
 
+                # MSSD/MSPD
+                # mssd_err = my_mssd(pred_R, pred_t, gt_R, gt_t, obj_model['pts'], bop_sym)
+                # mspd_err = my_mspd(pred_R, pred_t, gt_R, gt_t, K, obj_model['pts'], bop_sym)
                 mssd_err = my_mssd(pred_R, pred_t, gt_R, gt_t, obj_model['pts'], bop_sym)
                 mspd_err = my_mspd(pred_R, pred_t, gt_R, gt_t, K, obj_model['pts'], bop_sym)
 
+                # VSD
+                # print(depth.shape)
+                #
+                # depth_proc = depth.copy()
+                # depth = depth.astype(np.int32)
+                # depth_proc[depth_proc == 0] = depth_proc.max()
                 pred_R, pred_t = self.normalize_pose(pred_R, pred_t)
                 gt_R, gt_t = self.normalize_pose(gt_R, gt_t)
                 vsd_err = vsd(pred_R, pred_t, gt_R, gt_t, depth, K,
                               self.vsd_delta, self.vsd_taus, True, obj_diam,
                               self.vsd_renderer, obj_id)
+                # print("gt_t", gt_t)
+                # print("gt_R", gt_R)
+                # print("pred_t",pred_t)
+                # print("pred_R", pred_R)
+                # print("depth", depth)
+                # print("camera", K)
+                # print("obj_diam:", obj_diam)
+                # print("cls_id", obj_id)
+                # print("VSD errors:", vsd_err)
+                # test
+                # print("obj_diam:",obj_diam)
 
+                # print("K.shape",K.shape)
+                # # 处理 depth  0
+                # depth_proc = depth.copy()
+                # depth_proc[depth_proc == 0] = depth_proc.max()
+                # vsd_err = vsd(pred_R, pred_t, gt_R, gt_t, depth_proc, K,
+                #               self.vsd_delta, self.vsd_taus, True, obj_diam,
+                #               self.vsd_renderer, obj_id)
+
+            # 计算 recall 分数
             mssd_rec = np.arange(0.05, 0.51, 0.05) * obj_diam
-            mssd_scores.append((mssd_err < mssd_rec).mean())
+            mssd_scores.append((mssd_err < mssd_rec).mean())  # if 'mssd_err' in locals() else 0.0)
 
             mspd_rec = np.arange(5, 51, 5)
-            mspd_scores.append((mspd_err < mspd_rec).mean())
+            mspd_scores.append((mspd_err < mspd_rec).mean())  # if 'mspd_err' in locals() else 0.0)
 
+            # vsd_rec = np.arange(0.05, 0.51, 0.05)
+            # vsd_scores.append((np.array(vsd_err) < vsd_rec).mean())#if 'vsd_err' in locals() else 0.0)
+
+            #  VSD preprocess
             vsd_err = np.asarray(vsd_err)
             all_vsd_recs = np.stack([vsd_err < rec_i for rec_i in self.vsd_rec], axis=1)
             mean_vsd = all_vsd_recs.mean()
-
         logs = {
             'loss': total_loss.detach(),
             'pose_loss': pose_loss.detach(),
@@ -420,7 +1119,7 @@ class MicKeyTrainingModel(pl.LightningModule):
             'add01d_acc': add01d_acc,
             'mssd': torch.tensor(np.mean(mssd_scores) if mssd_scores else 0.0),
             'mspd': torch.tensor(np.mean(mspd_scores) if mspd_scores else 0.0),
-            'vsd': torch.tensor(mean_vsd),
+            'vsd': torch.tensor(mean_vsd)  # torch.tensor(np.mean(vsd_scores) if vsd_scores else 0.0),
         }
 
         self.validation_step_outputs.append(logs)
@@ -430,6 +1129,7 @@ class MicKeyTrainingModel(pl.LightningModule):
         if not self.validation_step_outputs:
             return
 
+        # 聚合所有batch的指标
         metrics = {
             'val/loss': torch.stack([x['loss'] for x in self.validation_step_outputs]).mean(),
             'val/pose_loss': torch.stack([x['pose_loss'] for x in self.validation_step_outputs]).mean(),
@@ -443,13 +1143,62 @@ class MicKeyTrainingModel(pl.LightningModule):
             'val/vsd': torch.stack([x['vsd'] for x in self.validation_step_outputs]).mean(),
         }
 
+        # 记录所有指标
+        for name, value in metrics.items():
+            self.log(name, value, on_epoch=True, sync_dist=self.multi_gpu, prog_bar=('loss' in name or 'acc' in name))
+
+        self.validation_step_outputs.clear()
+
+    def on_validation_epoch_end(self):
+        if not self.validation_step_outputs:
+            return
+
+        # 聚合所有batch的指标
+        metrics = {
+            'val/loss': torch.stack([x['loss'] for x in self.validation_step_outputs]).mean(),
+            'val/pose_loss': torch.stack([x['pose_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/pose_rot_loss': torch.stack([x['pose_rot_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/pose_trans_loss': torch.stack([x['pose_trans_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/mask_loss': torch.stack([x['mask_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/mask_iou': torch.stack([x['mask_iou'] for x in self.validation_step_outputs]).mean(),
+            'val/add01d_acc': torch.stack([x['add01d_acc'] for x in self.validation_step_outputs]).mean(),
+            'val/mssd': torch.stack([x['mssd'] for x in self.validation_step_outputs]).mean(),
+            'val/mspd': torch.stack([x['mspd'] for x in self.validation_step_outputs]).mean(),
+            'val/vsd': torch.stack([x['vsd'] for x in self.validation_step_outputs]).mean(),
+        }
+
+        # 记录所有指标
+        for name, value in metrics.items():
+            self.log(name, value, on_epoch=True, sync_dist=self.multi_gpu, prog_bar=('loss' in name or 'acc' in name))
+
+        self.validation_step_outputs.clear()
+
+    def on_validation_epoch_end(self):
+        if not self.validation_step_outputs:
+            return
+
+        # 聚合所有batch的指标
+        metrics = {
+            'val/loss': torch.stack([x['loss'] for x in self.validation_step_outputs]).mean(),
+            'val/pose_loss': torch.stack([x['pose_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/pose_rot_loss': torch.stack([x['pose_rot_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/pose_trans_loss': torch.stack([x['pose_trans_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/mask_loss': torch.stack([x['mask_loss'] for x in self.validation_step_outputs]).mean(),
+            'val/mask_iou': torch.stack([x['mask_iou'] for x in self.validation_step_outputs]).mean(),
+            'val/add01d_acc': torch.stack([x['add01d_acc'] for x in self.validation_step_outputs]).mean(),
+            'val/mssd': torch.stack([x['mssd'] for x in self.validation_step_outputs]).mean(),
+            'val/mspd': torch.stack([x['mspd'] for x in self.validation_step_outputs]).mean(),
+            'val/vsd': torch.stack([x['vsd'] for x in self.validation_step_outputs]).mean(),
+        }
+
+        # 记录所有指标
         for name, value in metrics.items():
             self.log(name, value, on_epoch=True, sync_dist=self.multi_gpu, prog_bar=('loss' in name or 'acc' in name))
 
         self.validation_step_outputs.clear()
 
     # -------------------------
-    #   优化器配置
+    #   Optim / Scheduler
     # -------------------------
     def configure_optimizers(self):
         optimizer = torch.optim.Adam(self.parameters(), lr=self.cfg.TRAINING.LR, eps=1e-6)
@@ -465,14 +1214,14 @@ class MicKeyTrainingModel(pl.LightningModule):
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'monitor': 'val/loss',
+                'monitor': 'val/loss',  # ✅ validation_step 或 epoch_end log  key 对应
                 'interval': 'epoch',
                 'frequency': 1
             }
         }
 
     # -------------------------
-    #   评估指标
+    #   ADD(S)-0.1D 评估
     # -------------------------
     def compute_add01d(self, batch, R_pred, t_pred):
         """计算ADD(S)-0.1d指标"""
@@ -482,16 +1231,19 @@ class MicKeyTrainingModel(pl.LightningModule):
         total, success = 0, 0
         for i in range(len(batch['obj_id'])):
             obj_id = batch['obj_id'][i]
+
             obj_model = self.obj_models[obj_id]
             obj_diam = self.obj_diams[obj_id]
             obj_sym = self.obj_symms.get(obj_id, None)
 
+            # 构造预测和GT姿态
             pred_pose = torch.eye(4, device=self.device)
             pred_pose[:3, :3] = R_pred[i]
             pred_pose[:3, 3] = t_pred[i].squeeze()
 
             gt_pose = batch['item_q_pose'][i]
 
+            # 计算ADD(S)
             if obj_sym is not None and len(obj_sym) > 0:
                 add_metric = compute_adds(obj_model['pts'] / 1000.,
                                           pred_pose.cpu().numpy(),
@@ -510,6 +1262,7 @@ class MicKeyTrainingModel(pl.LightningModule):
 
     @torch.no_grad()
     def add_object_info(self, obj_models: dict, obj_diams: dict, obj_symms: dict):
+        # these are supposed to be in mm!
         self.obj_models = obj_models
         self.obj_diams = obj_diams
         self.obj_symms = {k: format_sym_set(sym_set) for k, sym_set in obj_symms.items()}
@@ -518,10 +1271,729 @@ class MicKeyTrainingModel(pl.LightningModule):
             for obj_id, obj in self.obj_models.items():
                 self.vsd_renderer.my_add_object(obj, obj_id)
 
+    def run_add01d_eval(self):
+        """
+        - 需要 val_dataloader().dataset 提供 dataset.get_obj_info(obj_id)
+        - 逐 batch 用 forward_once 获取 R_pred,t_pred（已是 Query 的绝对姿态）
+        - 计算物体 ADD/ADD-S，并用 0.1D 判定成功
+        返回：成功率（百分比），若失败返回 None
+        """
+        try:
+            dm = self.trainer.datamodule
+            vloader = dm.val_dataloader()
+        except Exception as e:
+            print(f"[WARN] 获取 val_dataloader 失败：{e}")
+            return None
+
+        # dataset 必须实现 get_obj_info(obj_id) -> (model, diameter, sym)
+        dataset = getattr(vloader, 'dataset', None)
+        if dataset is None or not hasattr(dataset, 'get_obj_info'):
+            print("[WARN] val dataset 未提供 get_obj_info(obj_id)，跳过 ADD-0.1D 评估")
+            return None
+
+        total, success = 0, 0
+        device = self.device
+
+        for batch in vloader:
+            # 移动到设备
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+
+            # 预测绝对姿态
+            out = self.forward_once(batch)
+            R_pred = out['R_pred']  # [B,3,3]
+            t_pred = out['t_pred'].squeeze(1)  # [B,3] (m)
+
+            # GT 绝对姿态
+            T_q_gt = batch['item_q_pose']
+            R_gt = T_q_gt[:, :3, :3]
+            t_gt = T_q_gt[:, :3, 3]  # [B,3] (m)
+
+            obj_ids = batch['obj_id']  # [B]
+            B = R_pred.shape[0]
+            for i in range(B):
+                try:
+                    obj_model, obj_diam_mm, obj_sym = dataset.get_obj_info(obj_ids[i])
+                    pts3d_model = (obj_model['pts']).astype(np.float32) / 1000.0  # m
+                except Exception as e:
+                    print(f"[WARN] get_obj_info 失败：{e}")
+                    continue
+
+                # 构造 4x4 姿态
+                T_pred = np.eye(4, dtype=np.float32)
+                T_pred[:3, :3] = R_pred[i].detach().cpu().numpy()
+                T_pred[:3, 3] = t_pred[i].detach().cpu().numpy()
+
+                T_gt = np.eye(4, dtype=np.float32)
+                T_gt[:3, :3] = R_gt[i].detach().cpu().numpy()
+                T_gt[:3, 3] = t_gt[i].detach().cpu().numpy()
+
+                if len(obj_sym) > 0:
+                    add_metric = compute_adds(pts3d_model, T_pred, T_gt)
+                else:
+                    add_metric = compute_add(pts3d_model, T_pred, T_gt)
+
+                threshold_m = 0.1 * (obj_diam_mm / 1000.0)
+                ok = (add_metric < threshold_m)
+                total += 1
+                success += int(ok)
+
+        if total == 0:
+            print("[WARN] ADD(S)-0.1D 评估没有有效样本")
+            return None
+
+        acc = 100.0 * success / total
+        return acc
+
     def normalize_pose(self, R, t):
+        # R: 3x3 旋转矩阵
+        # t: 3x1 平移向量
         U, _, Vt = np.linalg.svd(R)
         R_ortho = U @ Vt
-        if np.linalg.det(R_ortho) < 0:
+        if np.linalg.det(R_ortho) < 0:  # 处理反射
             U[:, -1] *= -1
             R_ortho = U @ Vt
         return R_ortho, t
+
+    # def debug_loftr(self, batch):
+    #     """
+    #     Debug LoFTR + mask filtering + visualization + top-8 mconf filtering
+    #     保存原图、GT mask过滤图、LoFTR匹配可视化图
+    #     """
+    #
+    #     import os
+    #     import torch
+    #     import numpy as np
+    #     from PIL import Image
+    #     import torchvision.utils as vutils
+    #     import matplotlib.pyplot as plt
+    #     import cv2
+    #
+    #     save_dir = "debug_loftr"
+    #     os.makedirs(save_dir, exist_ok=True)
+    #
+    #     B = batch['image0'].shape[0]
+    #     num_save = min(3, B)
+    #     device = batch['image0'].device
+    #
+    #     for i in range(num_save):
+    #         img0 = batch['image0'][i:i + 1]  # [1,3,H,W]
+    #         img1 = batch['image1'][i:i + 1]
+    #         mask0 = batch['mask0_gt'][i]  # [H,W]
+    #         mask1 = batch['mask1_gt'][i]
+    #
+    #         # -------------------------
+    #         # 1) 保存原图
+    #         # -------------------------
+    #         vutils.save_image(img0, f"{save_dir}/image0_raw_{i}.png", normalize=True)
+    #         vutils.save_image(img1, f"{save_dir}/image1_raw_{i}.png", normalize=True)
+    #
+    #         # -------------------------
+    #         # 2) GT mask 过滤图
+    #         # -------------------------
+    #         mask0_t = mask0.unsqueeze(0).unsqueeze(0).float()
+    #         mask1_t = mask1.unsqueeze(0).unsqueeze(0).float()
+    #
+    #         img0_filtered = img0 * mask0_t
+    #         img1_filtered = img1 * mask1_t
+    #
+    #         vutils.save_image(img0_filtered, f"{save_dir}/image0_gtmask_{i}.png", normalize=True)
+    #         vutils.save_image(img1_filtered, f"{save_dir}/image1_gtmask_{i}.png", normalize=True)
+    #
+    #         def rgb_to_gray(img):
+    #             """
+    #             img: Tensor [B, 3, H, W] float, 0~1
+    #             return: [B, 1, H, W]
+    #             """
+    #             # NTSC标准权重，更贴近视觉特性
+    #             r, g, b = img[:, 0:1], img[:, 1:2], img[:, 2:3]
+    #             gray = 0.299 * r + 0.587 * g + 0.114 * b
+    #             return gray.float()
+    #
+    #         img0_gray_filtered = rgb_to_gray(img0_filtered)
+    #         img1_gray_filtered = rgb_to_gray(img1_filtered)
+    #         # -------------------------
+    #         # 3）送入 LoFTR
+    #         # -------------------------
+    #         match_batch = {'image0': img0_gray_filtered, 'image1':img1_gray_filtered}
+    #         with torch.no_grad():
+    #             self.matcher.eval()
+    #             self.matcher(match_batch)
+    #
+    #         mkpts0 = match_batch['mkpts0_f'].detach().cpu().numpy()  # [N, 2]
+    #         mkpts1 = match_batch['mkpts1_f'].detach().cpu().numpy()  # [N, 2]
+    #         mconf = match_batch['mconf'].detach().cpu().numpy()  # [N]
+    #
+    #         # if (self.useGTmask):
+    #         # if使用 GT 掩码
+    #         m0 = batch['mask0_gt'][i].detach().cpu().numpy()  # ★
+    #         m1 = batch['mask1_gt'][i].detach().cpu().numpy()  # ★
+    #         # else:
+    #         #     # if pred mask
+    #         #     m0 = pred_mask0_bin[i].detach().cpu().numpy()
+    #         #     m1 = pred_mask1_bin[i].detach().cpu().numpy()
+    #
+    #         if len(mkpts0) == 0:
+    #             print("error,len(mkpts0)<0 after loftr")
+    #             continue
+    #
+    #         # # 按掩码过滤关键点
+    #         # in_mask = (m0[mkpts0[:, 1].round().astype(int),
+    #         # mkpts0[:, 0].round().astype(int)] > 0) & \
+    #         #           (m1[mkpts1[:, 1].round().astype(int),
+    #         #           mkpts1[:, 0].round().astype(int)] > 0)
+    #         # mkpts0 = mkpts0[in_mask]
+    #         # mkpts1 = mkpts1[in_mask]
+    #         #
+    #         # if len(mkpts0) < 3:
+    #         #     print("error,len(mkpts0)<3 after filtering")
+    #         #     R_preds.append(torch.eye(3, device=device))
+    #         #     t_preds.append(torch.zeros(1, 3, device=device))
+    #         #     continue
+    #
+    #         # ✅ 按掩码过滤关键点
+    #         in_mask = (m0[mkpts0[:, 1].round().astype(int),
+    #         mkpts0[:, 0].round().astype(int)] > 0) & \
+    #                   (m1[mkpts1[:, 1].round().astype(int),
+    #                   mkpts1[:, 0].round().astype(int)] > 0)
+    #
+    #         mkpts0 = mkpts0[in_mask]
+    #         mkpts1 = mkpts1[in_mask]
+    #         mconf = mconf[in_mask]  # ★ 同步过滤置信度
+    #
+    #         # -------------------------
+    #         # 4）按置信度排序，取 top-8
+    #         # -------------------------
+    #         idx = np.argsort(-mconf)[:8]
+    #         mkpts0 = mkpts0[idx]
+    #         mkpts1 = mkpts1[idx]
+    #         mconf = mconf[idx]
+    #
+    #         # -------------------------
+    #         # 5）画匹配可视化图
+    #         # -------------------------
+    #         img0_vis = (img0.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    #         img1_vis = (img1.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+    #
+    #         # ✅ 拼接并确保 OpenCV-friendly 格式
+    #         concat = np.concatenate([img0_vis, img1_vis], axis=1).astype(np.uint8).copy()
+    #
+    #         for (p0, p1) in zip(mkpts0, mkpts1):
+    #             p1_shift = p1.copy()
+    #             p1_shift[0] += img0_vis.shape[1]  # shift x of image1
+    #
+    #             p0 = p0.astype(int)
+    #             p1_shift = p1_shift.astype(int)
+    #
+    #             cv2.line(concat, tuple(p0), tuple(p1_shift), (255, 0, 0), 1)
+    #
+    #         Image.fromarray(concat).save(f"{save_dir}/match_vis_{i}.png")
+    def debug_loftr(self, batch):
+        """
+        Debug LoFTR + mask filtering + visualization + top-8 mconf filtering
+        保存原图、GT mask过滤图、LoFTR匹配可视化图 +
+        保存GT pose与Pred pose + mask点云 + 3D关键点可视化
+        """
+        import os, torch, numpy as np, cv2
+        import torchvision.utils as vutils
+        from PIL import Image
+        try:
+            import open3d as o3d
+        except Exception:
+            o3d = None
+
+        save_dir = "debug_loftr"
+        os.makedirs(save_dir, exist_ok=True)
+
+        # pose log
+        pose_log = os.path.join(save_dir, "pose_log.txt")
+
+        # ✅ 清空 pose_log 文件（覆盖模式）
+        with open(pose_log, "w") as f:
+            f.write("=== Pose Debug Log ===\n")
+
+        B = batch['image0'].shape[0]
+        num_save = min(3, B)
+        device = batch['image0'].device
+
+        for i in range(num_save):
+
+            # ✅ sample_i 子文件夹
+            sample_dir = f"{save_dir}/sample_{i}"
+            os.makedirs(sample_dir, exist_ok=True)
+
+            img0 = batch['image0'][i:i + 1]  # [1,3,H,W]
+            img1 = batch['image1'][i:i + 1]
+            mask0 = batch['mask0_gt'][i]
+            mask1 = batch['mask1_gt'][i]
+            depth0 = batch['depth0'][i].detach().cpu().numpy() / 10.
+            depth1 = batch['depth1'][i].detach().cpu().numpy() / 10.
+            K0 = batch['K_color0'][i].detach().cpu().numpy()
+            K1 = batch['K_color1'][i].detach().cpu().numpy()
+
+            # 1) 保存原图
+            vutils.save_image(img0, f"{sample_dir}/image0_raw.png", normalize=True)
+            vutils.save_image(img1, f"{sample_dir}/image1_raw.png", normalize=True)
+
+            # 2) 保存 mask 过滤图
+            mask0_t = mask0.unsqueeze(0).unsqueeze(0).float()
+            mask1_t = mask1.unsqueeze(0).unsqueeze(0).float()
+            img0_filtered = img0 * mask0_t
+            img1_filtered = img1 * mask1_t
+            vutils.save_image(img0_filtered, f"{sample_dir}/image0_gtmask.png", normalize=True)
+            vutils.save_image(img1_filtered, f"{sample_dir}/image1_gtmask.png", normalize=True)
+
+            # rgb to gray
+            r, g, b = img0_filtered[:, 0:1], img0_filtered[:, 1:2], img0_filtered[:, 2:3]
+            img0_gray_filtered = (0.299 * r + 0.587 * g + 0.114 * b).float()
+            r, g, b = img1_filtered[:, 0:1], img1_filtered[:, 1:2], img1_filtered[:, 2:3]
+            img1_gray_filtered = (0.299 * r + 0.587 * g + 0.114 * b).float()
+
+            # 3) 特征匹配 (LoFTR 或 SIFT)
+            m0 = mask0.detach().cpu().numpy()
+            m1 = mask1.detach().cpu().numpy()
+
+            if self.use_sift:
+                mkpts0, mkpts1, mconf = self.match_with_sift(
+                    img0_gray_filtered,
+                    img1_gray_filtered,
+                    mask0=m0,
+                    mask1=m1
+                )
+            else:
+                match_batch = {'image0': img0_gray_filtered, 'image1': img1_gray_filtered}
+                with torch.no_grad():
+                    self.matcher.eval()
+                    self.matcher(match_batch)
+
+                mkpts0 = match_batch['mkpts0_f'].cpu().numpy()
+                mkpts1 = match_batch['mkpts1_f'].cpu().numpy()
+                mconf = match_batch['mconf'].cpu().numpy()
+
+            # mask filter (用GT mask) - SIFT已经在检测时使用mask，这里再次过滤确保准确
+            if not self.use_sift:
+                # LoFTR需要后处理mask过滤
+                in_mask = (m0[mkpts0[:, 1].round().astype(int), mkpts0[:, 0].round().astype(int)] > 0) & \
+                          (m1[mkpts1[:, 1].round().astype(int), mkpts1[:, 0].round().astype(int)] > 0)
+            else:
+                # SIFT已经在detectAndCompute时使用了mask，但为了一致性仍然过滤
+                in_mask = (m0[mkpts0[:, 1].round().astype(int), mkpts0[:, 0].round().astype(int)] > 0) & \
+                          (m1[mkpts1[:, 1].round().astype(int), mkpts1[:, 0].round().astype(int)] > 0)
+
+            mkpts0 = mkpts0[in_mask]
+            mkpts1 = mkpts1[in_mask]
+            mconf = mconf[in_mask]
+
+            if len(mkpts0) < 3:
+                print("❌ less than 3 correspondences after mask filtering")
+                continue
+
+            # 4) Top-K filter (和 forward_once 保持一致)
+            top_k = getattr(self, "top_k_matches", None)
+            if top_k is None:
+                top_k = getattr(self, "topk_filter", 8)
+            if top_k is not None and top_k > 0:
+                if len(mkpts0) >= top_k:
+                    idx = np.argsort(-mconf)[:top_k]
+                    mkpts0 = mkpts0[idx]
+                    mkpts1 = mkpts1[idx]
+                    mconf = mconf[idx]
+                elif len(mkpts0) < 3:
+                    print(f"❌ less than 3 correspondences after top-k (got {len(mkpts0)})")
+                    continue
+
+            # 5) 调整内参（如果需要）与回投影
+            current_h = img0.shape[2]
+            current_w = img0.shape[3]
+            if hasattr(self, "adjust_intrinsics_for_resize"):
+                K0_adj = self.adjust_intrinsics_for_resize(K0, original_size=(640, 480),
+                                                           current_size=(current_w, current_h))
+                K1_adj = self.adjust_intrinsics_for_resize(K1, original_size=(640, 480),
+                                                           current_size=(current_w, current_h))
+            else:
+                K0_adj = K0.copy()
+                K1_adj = K1.copy()
+
+            if hasattr(self, "backproject"):
+                pts3d_0, valid0 = self.backproject(mkpts0, depth0, K0_adj)
+                pts3d_1, valid1 = self.backproject(mkpts1, depth1, K1_adj)
+            else:
+                def _local_backproject(pts2d, depth, K):
+                    pts_3d = []
+                    valid = []
+                    fx = K[0, 0];
+                    fy = K[1, 1];
+                    cx = K[0, 2];
+                    cy = K[1, 2]
+                    for (u_f, v_f) in pts2d:
+                        u = int(round(u_f));
+                        v = int(round(v_f))
+                        if v < 0 or v >= depth.shape[0] or u < 0 or u >= depth.shape[1]:
+                            valid.append(False);
+                            pts_3d.append([0, 0, 0]);
+                            continue
+                        z = depth[v, u]
+                        if z <= 0:
+                            valid.append(False);
+                            pts_3d.append([0, 0, 0])
+                        else:
+                            x = (u - cx) * z / fx
+                            y = (v - cy) * z / fy
+                            pts_3d.append([x, y, z]);
+                            valid.append(True)
+                    return np.array(pts_3d), np.array(valid, dtype=bool)
+
+                pts3d_0, valid0 = _local_backproject(mkpts0, depth0, K0_adj)
+                pts3d_1, valid1 = _local_backproject(mkpts1, depth1, K1_adj)
+
+            valid = valid0 & valid1
+            if np.count_nonzero(valid) < 3:
+                print("❌ less than 3 valid 3D correspondences after backprojection")
+                continue
+
+            A = pts3d_0[valid]
+            Bp = pts3d_1[valid]
+
+            # Kabsch
+            if hasattr(self, "kabsch_umeyama"):
+                R_np, t_np = self.kabsch_umeyama(A, Bp)
+            else:
+                def _kabsch(A_pts, B_pts):
+                    pA = A_pts.mean(axis=0)
+                    pB = B_pts.mean(axis=0)
+                    H = (A_pts - pA).T @ (B_pts - pB)
+                    U, S, Vt = np.linalg.svd(H)
+                    R = Vt.T @ U.T
+                    if np.linalg.det(R) < 0:
+                        Vt[2, :] *= -1;
+                        R = Vt.T @ U.T
+                    t = pB - R @ pA
+                    return R, t
+
+                R_np, t_np = _kabsch(A, Bp)
+
+                # 10) 转到绝对位姿
+            T_a = batch['item_a_pose'][i].detach().cpu().numpy()
+            T_rel = np.eye(4, dtype=np.float32)
+            T_rel[:3, :3] = R_np
+            T_rel[:3, 3] = (t_np / 1000.0)
+            T_q_pred = T_rel @ T_a
+            R = torch.from_numpy(T_q_pred[:3, :3]).float().to(device)
+            t = torch.from_numpy(T_q_pred[:3, 3]).float().to(device).unsqueeze(0)
+            # R = R_np
+            # t = t_np / 1000.
+
+            # ---- ✅ 保存GT & Pred pose ----
+            R_gt = batch['item_q_pose'][i, :3, :3].cpu().numpy()
+            t_gt = batch['item_q_pose'][i, :3, 3].cpu().numpy()
+            with open(pose_log, "a") as f:
+                f.write(f"\n==== Sample {i} ====\n")
+                f.write("GT_R:\n" + str(R_gt) + "\nGT_t:" + str(t_gt) + "\n")
+                f.write("Pred_R:\n" + str(R) + "\nPred_t:" + str(t) + "\n")
+
+            # ==== ✅ image0 mask → 3D 点云 ====
+            mask_pts0 = np.argwhere(m0 > 0)
+            if mask_pts0.shape[0] > 0:
+                mask_uv0 = mask_pts0[:, [1, 0]]
+                if hasattr(self, "backproject"):
+                    pc_mask0, _ = self.backproject(mask_uv0, depth0, K0_adj)
+                else:
+                    pc_mask0, _ = _local_backproject(mask_uv0, depth0, K0_adj)
+            else:
+                pc_mask0 = np.zeros((0, 3))
+
+            # ==== ✅ image1 mask → 3D 点云（新加） ====
+            mask_pts1 = np.argwhere(m1 > 0)
+            if mask_pts1.shape[0] > 0:
+                mask_uv1 = mask_pts1[:, [1, 0]]
+                if hasattr(self, "backproject"):
+                    pc_mask1, _ = self.backproject(mask_uv1, depth1, K1_adj)
+                else:
+                    pc_mask1, _ = _local_backproject(mask_uv1, depth1, K1_adj)
+            else:
+                pc_mask1 = np.zeros((0, 3))
+
+            # final LoFTR 3D keypoints (image0 domain)
+            pc_key0 = A.copy()
+            pc_key1 = Bp.copy()
+            # ==== ✅ 保存Ply ====
+            if o3d is not None:
+                # image0 mask cloud
+                if pc_mask0.shape[0] > 0:
+                    pcd0 = o3d.geometry.PointCloud()
+                    pcd0.points = o3d.utility.Vector3dVector(pc_mask0)
+                    pcd0.paint_uniform_color([0.5, 0.5, 0.5])
+                    o3d.io.write_point_cloud(f"{sample_dir}/pc_mask_img0.ply", pcd0)
+
+                # image1 mask cloud（新加）
+                if pc_mask1.shape[0] > 0:
+                    pcd1 = o3d.geometry.PointCloud()
+                    pcd1.points = o3d.utility.Vector3dVector(pc_mask1)
+                    pcd1.paint_uniform_color([0.0, 0.5, 1.0])  # 蓝色
+                    o3d.io.write_point_cloud(f"{sample_dir}/pc_mask_img1.ply", pcd1)
+
+                # keypoints0
+                if pc_key0.shape[0] > 0:
+                    pcdk = o3d.geometry.PointCloud()
+                    pcdk.points = o3d.utility.Vector3dVector(pc_key0)
+                    pcdk.paint_uniform_color([1, 0, 0])
+                    o3d.io.write_point_cloud(f"{sample_dir}/pc_keypoints_0.ply", pcdk)
+                if pc_key1.shape[0] > 0:
+                    pcdk = o3d.geometry.PointCloud()
+                    pcdk.points = o3d.utility.Vector3dVector(pc_key1)
+                    pcdk.paint_uniform_color([1, 0, 0])
+                    o3d.io.write_point_cloud(f"{sample_dir}/pc_keypoints_1.ply", pcdk)
+
+                ##merged
+                if pc_mask0.shape[0] > 0:
+                    pcd_mix0 = o3d.geometry.PointCloud()
+                    #  mask points
+                    pcd_mix0.points = o3d.utility.Vector3dVector(pc_mask0)
+                    colors0 = np.tile(np.array([[0.5, 0.5, 0.5]]), (pc_mask0.shape[0], 1))  # gray
+
+                    # keypoints0
+                    if pc_key0.shape[0] > 0:
+                        pts_all0 = np.vstack([pc_mask0, pc_key0])
+                        pcd_mix0.points = o3d.utility.Vector3dVector(pts_all0)
+                        colors0 = np.vstack([
+                            colors0,
+                            np.tile(np.array([[1.0, 0.0, 0.0]]), (pc_key0.shape[0], 1))  # red
+                        ])
+
+                    pcd_mix0.colors = o3d.utility.Vector3dVector(colors0)
+                    o3d.io.write_point_cloud(f"{sample_dir}/pc_mix_img0_mask_keypoints.ply", pcd_mix0)
+
+                    # ==== ✅ image1 混合点云 ====
+                if pc_mask1.shape[0] > 0:
+                    pcd_mix1 = o3d.geometry.PointCloud()
+                    pcd_mix1.points = o3d.utility.Vector3dVector(pc_mask1)
+                    colors1 = np.tile(np.array([[0.5, 0.5, 0.5]]), (pc_mask1.shape[0], 1))  # gray
+
+                    if pc_key1.shape[0] > 0:
+                        pts_all1 = np.vstack([pc_mask1, pc_key1])
+                        pcd_mix1.points = o3d.utility.Vector3dVector(pts_all1)
+                        colors1 = np.vstack([
+                            colors1,
+                            np.tile(np.array([[1.0, 0.0, 0.0]]), (pc_key1.shape[0], 1))  # red
+                        ])
+
+                    pcd_mix1.colors = o3d.utility.Vector3dVector(colors1)
+                    o3d.io.write_point_cloud(f"{sample_dir}/pc_mix_img1_mask_keypoints.ply", pcd_mix1)
+
+            # ==== ✅ 3D matplotlib 保存 ====
+
+            try:
+                import matplotlib.pyplot as plt
+                from mpl_toolkits.mplot3d import Axes3D
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection='3d')
+
+                # image0 mask = gray
+                if pc_mask0.shape[0] > 0:
+                    ax.scatter(pc_mask0[:, 0], pc_mask0[:, 1], pc_mask0[:, 2], s=1, c='gray', label="mask0 (img0)")
+
+                # image1 mask = blue
+                if pc_mask1.shape[0] > 0:
+                    ax.scatter(pc_mask1[:, 0], pc_mask1[:, 1], pc_mask1[:, 2], s=1, c='blue', label="mask1 (img1)")
+
+                # image0 keypoints = red
+                if pc_key0.shape[0] > 0:
+                    ax.scatter(pc_key0[:, 0], pc_key0[:, 1], pc_key0[:, 2], s=30, c='red', label="keypoints0 (img0)")
+
+                # image1 keypoints = green
+                if pc_key1.shape[0] > 0:
+                    ax.scatter(pc_key1[:, 0], pc_key1[:, 1], pc_key1[:, 2], s=30, c='lime', label="keypoints1 (img1)")
+
+                # ---- ✅ draw match lines between keypoints in 3D ----
+                if pc_key0.shape[0] > 0 and pc_key1.shape[0] > 0:
+                    for p0, p1 in zip(pc_key0, pc_key1):
+                        xs = [p0[0], p1[0]]
+                        ys = [p0[1], p1[1]]
+                        zs = [p0[2], p1[2]]
+                        ax.plot(xs, ys, zs, linewidth=0.8, color='black')  # thin black line
+
+                plt.title("3D Visualization: Mask Point Cloud + Keypoints")
+                ax.legend(loc='upper right')
+
+                plt.savefig(f"{sample_dir}/3d_vis.png", dpi=300)
+                plt.close()
+
+            except Exception as e:
+                print("3D vis error:", e)
+                pass
+
+            # #3d merged two
+            # 3d merged two -> Plotly HTML (headless-friendly)
+            try:
+                import numpy as np
+                try:
+                    import plotly.graph_objects as go
+                except Exception as e_plot:
+                    # plotly not installed: fallback to saving PLY only
+                    print(
+                        "plotly not available, fallback to PLY. Install plotly (`pip install plotly`) for interactive html.")
+                    all_pts = []
+                    for arr in [pc_mask0, pc_mask1, pc_key0, pc_key1]:
+                        if arr is not None and arr.shape[0] > 0:
+                            all_pts.append(arr)
+                    if len(all_pts) > 0:
+                        import open3d as o3d
+                        pcd_all = o3d.geometry.PointCloud()
+                        pcd_all.points = o3d.utility.Vector3dVector(np.vstack(all_pts))
+                        o3d.io.write_point_cloud(f"{sample_dir}/vis_all_points.ply", pcd_all)
+                    raise
+
+                # helper to create scatter trace for a point cloud
+                def make_scatter3d(points, name, color, size=1, mode='markers'):
+                    if points is None or points.shape[0] == 0:
+                        return None
+                    x = points[:, 0].tolist()
+                    y = points[:, 1].tolist()
+                    z = points[:, 2].tolist()
+                    return go.Scatter3d(x=x, y=y, z=z,
+                                        mode=mode,
+                                        name=name,
+                                        marker=dict(size=size, color=color, opacity=0.8),
+                                        hoverinfo='name')
+
+                traces = []
+                # mask0 (gray small points)
+                t = make_scatter3d(pc_mask0, "mask0 (img0)", 'rgb(160,160,160)', size=1)
+                if t is not None: traces.append(t)
+                # mask1 (blue small points)
+                t = make_scatter3d(pc_mask1, "mask1 (img1)", 'rgb(50,150,255)', size=1)
+                if t is not None: traces.append(t)
+                # key0 (red bigger)
+                t = make_scatter3d(pc_key0, "keypoints0 (img0)", 'rgb(255,30,30)', size=4)
+                if t is not None: traces.append(t)
+                # key1 (green bigger)
+                t = make_scatter3d(pc_key1, "keypoints1 (img1)", 'rgb(30,200,30)', size=4)
+                if t is not None: traces.append(t)
+
+                # build one lines trace that contains all segments (use None separators)
+                if pc_key0 is not None and pc_key1 is not None and pc_key0.shape[0] > 0 and pc_key1.shape[0] > 0:
+                    n_lines = min(pc_key0.shape[0], pc_key1.shape[0])
+                    xs, ys, zs = [], [], []
+                    for idx in range(n_lines):
+                        p0 = pc_key0[idx]
+                        p1 = pc_key1[idx]
+                        xs.extend([float(p0[0]), float(p1[0]), None])
+                        ys.extend([float(p0[1]), float(p1[1]), None])
+                        zs.extend([float(p0[2]), float(p1[2]), None])
+                    line_trace = go.Scatter3d(x=xs, y=ys, z=zs,
+                                              mode='lines',
+                                              name='matches',
+                                              line=dict(color='rgb(0,0,0)', width=2),
+                                              hoverinfo='none')
+                    traces.append(line_trace)
+
+                # layout: set aspectmode to 'data' so axes are equal
+                layout = go.Layout(
+                    title="3D Visualization: Mask Point Cloud + Keypoints + Matches",
+                    scene=dict(
+                        xaxis=dict(title='X', visible=False),
+                        yaxis=dict(title='Y', visible=False),
+                        zaxis=dict(title='Z', visible=False),
+                        aspectmode='data'
+                    ),
+                    legend=dict(itemsizing='constant'),
+                    margin=dict(l=0, r=0, b=0, t=30)
+                )
+
+                fig = go.Figure(data=traces, layout=layout)
+                html_path = os.path.join(sample_dir, "vis_3d.html")
+                fig.write_html(html_path, include_plotlyjs='cdn')  # single-file html (uses CDN for plotly js)
+                print(f"Saved interactive HTML viewer to: {html_path}")
+
+                # also keep a PLY snapshot of points (no lines) for external tools
+                try:
+                    import open3d as o3d
+                    all_pts = []
+                    all_colors = []
+                    if pc_mask0 is not None and pc_mask0.shape[0] > 0:
+                        all_pts.append(pc_mask0);
+                        all_colors.append(np.tile([0.6, 0.6, 0.6], (pc_mask0.shape[0], 1)))
+                    if pc_mask1 is not None and pc_mask1.shape[0] > 0:
+                        all_pts.append(pc_mask1);
+                        all_colors.append(np.tile([0.2, 0.6, 1.0], (pc_mask1.shape[0], 1)))
+                    if pc_key0 is not None and pc_key0.shape[0] > 0:
+                        all_pts.append(pc_key0);
+                        all_colors.append(np.tile([1.0, 0.2, 0.2], (pc_key0.shape[0], 1)))
+                    if pc_key1 is not None and pc_key1.shape[0] > 0:
+                        all_pts.append(pc_key1);
+                        all_colors.append(np.tile([0.2, 1.0, 0.2], (pc_key1.shape[0], 1)))
+                    if len(all_pts) > 0:
+                        pts_all = np.vstack(all_pts)
+                        cols_all = np.vstack(all_colors)
+                        pcd_out = o3d.geometry.PointCloud()
+                        pcd_out.points = o3d.utility.Vector3dVector(pts_all)
+                        pcd_out.colors = o3d.utility.Vector3dVector(cols_all)
+                        o3d.io.write_point_cloud(f"{sample_dir}/vis_all_points.ply", pcd_out)
+                except Exception:
+                    pass
+
+            except Exception as e:
+                print("3D web export failed:", e)
+                pass
+
+            # try:
+            #     import open3d as o3d
+            #     import numpy as np
+            #
+            #     vis_pcd = []
+            #
+            #     def make_pcd(points, color):
+            #         if points.shape[0] == 0:
+            #             return None
+            #         p = o3d.geometry.PointCloud()
+            #         p.points = o3d.utility.Vector3dVector(points)
+            #         p.colors = o3d.utility.Vector3dVector(np.tile(color, (points.shape[0], 1)))
+            #         return p
+            #
+            #     # === 点云 ===
+            #     pcd_mask0 = make_pcd(pc_mask0, np.array([0.6, 0.6, 0.6]))  # gray
+            #     pcd_mask1 = make_pcd(pc_mask1, np.array([0.2, 0.6, 1.0]))  # blue
+            #     pcd_key0 = make_pcd(pc_key0, np.array([1.0, 0.2, 0.2]))  # red
+            #     pcd_key1 = make_pcd(pc_key1, np.array([0.2, 1.0, 0.2]))  # green
+            #
+            #     for p in [pcd_mask0, pcd_mask1, pcd_key0, pcd_key1]:
+            #         if p is not None:
+            #             vis_pcd.append(p)
+            #
+            #     # === 连线（关键点匹配）===
+            #     if pc_key0.shape[0] > 0 and pc_key1.shape[0] > 0:
+            #         lines = []
+            #         for i in range(min(pc_key0.shape[0], pc_key1.shape[0])):
+            #             lines.append([i, i + pc_key0.shape[0]])
+            #
+            #         # 合并关键点
+            #         all_keys = np.vstack([pc_key0, pc_key1])
+            #         line_set = o3d.geometry.LineSet()
+            #         line_set.points = o3d.utility.Vector3dVector(all_keys)
+            #         line_set.lines = o3d.utility.Vector2iVector(lines)
+            #         line_set.colors = o3d.utility.Vector3dVector([[0, 0, 0] for _ in lines])  # black
+            #
+            #         vis_pcd.append(line_set)
+            #
+            #     # === 可交互查看 ===
+            #     #o3d.visualization.draw_geometries(vis_pcd, window_name="3D Keypoint Match Viewer")
+            #     o3d.io.write_point_cloud(f"{sample_dir}/vis_all_points.ply", pcd_mask0 + pcd_mask1 + pcd_key0 + pcd_key1)
+            #
+            # except Exception as e:
+            #     print("Open3D visualization failed:", e)
+            #     pass
+
+            # ✅ LoFTR match vis
+            img0_vis = (img0.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            img1_vis = (img1.squeeze().permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+            concat = np.concatenate([img0_vis, img1_vis], axis=1).copy()
+            W = img0_vis.shape[1]
+            mk0_vis = mkpts0[valid]
+            mk1_vis = mkpts1[valid]
+            for p0, p1 in zip(mk0_vis, mk1_vis):
+                p1s = p1.copy();
+                p1s[0] += W
+                cv2.line(concat, tuple(p0.astype(int)), tuple(p1s.astype(int)), (0, 255, 0), 1)
+            Image.fromarray(concat).save(f"{sample_dir}/match_vis.png")
+

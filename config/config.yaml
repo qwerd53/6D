@@ -5,7 +5,7 @@ DEBUG: False
 TRAINING:
   NUM_GPUS: 2
   #BATCH_SIZE: 24 # BS for each dataloader (in every GPU)
-  BATCH_SIZE: 32
+  BATCH_SIZE: 16
   #NUM_WORKERS: 8
   NUM_WORKERS: 2
   SAMPLER: 'scene_balance'

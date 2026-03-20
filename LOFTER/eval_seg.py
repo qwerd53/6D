@@ -6,7 +6,7 @@ import os, sys
 sys.path.append(os.getcwd())
 from lib.datasets.datamodules import DataModule
 #import filesOfOryon.datasets
-from filesOfOryon.datasets import Shapenet6DDataset, NOCSDataset, TOYLDataset,YCBVDataset
+from filesOfOryon.datasets import Shapenet6DDataset, NOCSDataset, TOYLDataset,YCBVDataset,LMDataset
 from filesOfOryon.utils.geo6d import best_fit_transform_with_RANSAC
 from filesOfOryon.utils.pointdsc.init import get_pointdsc_pose, get_pointdsc_solver
 
@@ -150,6 +150,8 @@ if __name__ == '__main__':
     elif dataset_name.lower() == 'toyl':
         dataset = TOYLDataset(dataset_args, eval=True)
     elif dataset_name.lower() == 'ycbv':
+        dataset = YCBVDataset(dataset_args, eval=True)
+    elif dataset_name.lower() == 'lm':
         dataset = YCBVDataset(dataset_args, eval=True)
     else:
         raise ValueError(f"Unsupported dataset: {dataset_name}")

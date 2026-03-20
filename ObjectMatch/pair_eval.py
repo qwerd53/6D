@@ -2,13 +2,15 @@ import argparse
 import json
 import os
 import sys
-
+import sys
+#sys.path.append("/data/WDY/Talk2DINO")
+sys.path.append(os.getcwd())
 import numpy as np
 from tqdm import tqdm
 
-from optim.common import load_matrix
-from optim.solver import test
-from pairwise_backend import (
+from ObjectMatch.optim.common import load_matrix
+from ObjectMatch.optim.solver import test
+from ObjectMatch.pairwise_backend import (
     KPConfig,
     NOCPredConfig,
     ObjectIDConfig,

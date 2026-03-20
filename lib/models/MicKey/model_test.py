@@ -44,7 +44,7 @@ from lib.utils.metrics import pose_error_torch  # 仅用于可选对齐检查（
 from lib.benchmarks.utils import precision_recall  # 日志需要的话可以继续用
 from filesOfOryon.utils.metrics import compute_add, compute_adds  # 用于 ADD/ADD-S
 from filesOfOryon.utils.geo6d import best_fit_transform_with_RANSAC  # 可选的RANSAC
-# from filesOfOryon.utils.pointdsc.init import get_pointdsc_pose, get_pointdsc_solver  # 如需PointDSC就打开
+from filesOfOryon.utils.pointdsc.init import get_pointdsc_pose, get_pointdsc_solver  # 如需PointDSC就打开
 from filesOfOryon.utils.losses import DiceLoss, LovaszLoss, FocalLoss
 
 #from lib.models.MicKey.debug_loftr import debug_loftr
@@ -139,7 +139,11 @@ class MicKeyTrainingModel(pl.LightningModule):
         self.useGTmask=False
 
         self.debug_loftr_flag =False # 调试开关
-        self.top_k_matches=0#for lm and toyl
+
+        self.FirstMask=False
+        self.SecondMask=False
+        self.top_k_matches=0  #     =8 for lm and ycbv
+
         if(self.top_k_matches==0):
             print("all valid points to 3d")
         else:
@@ -443,9 +447,14 @@ class MicKeyTrainingModel(pl.LightningModule):
             img0_gray = self.rgb_to_gray(batch['image0']) * batch['mask0_gt'].unsqueeze(1)
             img1_gray = self.rgb_to_gray(batch['image1']) * batch['mask1_gt'].unsqueeze(1)
         else:
-            #pred灰度图过滤
-            img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
-            img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
+            # pred灰度图过滤 1st
+            if(self.FirstMask):
+                img0_gray = self.rgb_to_gray(batch['image0']) * pred_mask0_bin.unsqueeze(1)
+                img1_gray = self.rgb_to_gray(batch['image1']) * pred_mask1_bin.unsqueeze(1)
+            #no 1st
+            else:
+                img0_gray = self.rgb_to_gray(batch['image0'])
+                img1_gray = self.rgb_to_gray(batch['image1'])
 
         # 7) LoFTR 匹配
         R_preds, t_preds = [], []
@@ -490,15 +499,20 @@ class MicKeyTrainingModel(pl.LightningModule):
             #     t_preds.append(torch.zeros(1, 3, device=device))
             #     continue
 
-            # ✅ 按掩码过滤关键点
-            in_mask = (m0[mkpts0[:, 1].round().astype(int),
-            mkpts0[:, 0].round().astype(int)] > 0) & \
-                      (m1[mkpts1[:, 1].round().astype(int),
-                      mkpts1[:, 0].round().astype(int)] > 0)
+            ### ✅ 按掩码过滤关键点 2st filter
+            if (self.SecondMask):
+                in_mask = (m0[mkpts0[:, 1].round().astype(int),
+                mkpts0[:, 0].round().astype(int)] > 0) & \
+                          (m1[mkpts1[:, 1].round().astype(int),
+                          mkpts1[:, 0].round().astype(int)] > 0)
 
-            mkpts0 = mkpts0[in_mask]
-            mkpts1 = mkpts1[in_mask]
-            mconf = mconf[in_mask]  # ★ 同步过滤置信度
+                mkpts0 = mkpts0[in_mask]
+                mkpts1 = mkpts1[in_mask]
+                mconf = mconf[in_mask]  # ★ 同步过滤置信度
+            ###
+
+
+
             #print("len(mkpts0 after mask2d:", len(mkpts0))
             # # ✅ 按置信度排序并取 Top-8
             # if len(mkpts0) >= 8:

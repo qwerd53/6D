@@ -14,9 +14,11 @@ import argparse
 from omegaconf import DictConfig
 from yacs.config import CfgNode as CN
 
+#from lib.models.MicKey.model_test_plusmetric import MicKeyTrainingModel
+from lib.models.MicKey.model_test_visualize import MicKeyTrainingModel
 #from lib.models.MicKey.model_test import MicKeyTrainingModel
 #from lib.models.MicKey.model_test_sift import MicKeyTrainingModel
-from lib.models.MicKey.model_test_objmatching import MicKeyTrainingModel
+#from lib.models.MicKey.model_test_objmatching import MicKeyTrainingModel
 #from lib.models.MicKey.model_test_talk2dino import MicKeyTrainingModel
 from lib.datasets.datamodules import DataModule
 
@@ -38,21 +40,23 @@ def get_dataset_args_dict(dataset_name='NOCS', root_path='filesOfOryon/data', se
             #'img_size': [480, 640],
             'img_size': [480, 640],
             'max_corrs': 4,
-            'test': {'name': 'NOCS', 'split': 'val', 'obj': 'all'}
+            #'test': {'name': 'NOCS', 'split': 'val', 'obj': 'all'}
             #'test': {'name': 'TOYL', 'split': 'cross_scene_test', 'obj': 'all'}
-            #'test': {'name': 'YCBV', 'split': 'test', 'obj': 'all'}
+            'test': {'name': 'YCBV', 'split': 'test', 'obj': 'all'}
             #'test': {'name': 'LM', 'split': 'test', 'obj': 'all'}
         },
         'TRAINING': {
-            'BATCH_SIZE': 32,
-            'NUM_WORKERS': 4,
+            'BATCH_SIZE': 16,#32,
+            'NUM_WORKERS': 1, #4
             'SAMPLER': 'scene_balance',
             'N_SAMPLES_SCENE': 4,
             'SAMPLE_WITH_REPLACEMENT': True
         },
         'augs': {
-            'rgb': {'jitter': False, 'bright': False, 'hflip': False, 'vflip': False},
-            'text': {'synset': False}
+            #'rgb': {'jitter': False, 'bright': False, 'hflip': False, 'vflip': False},
+            #'text': {'synset': False}
+            'rgb': {'jitter': True, 'bright': True, 'hflip': True, 'vflip': True},
+            'text': {'synset': True}
             # 'rgb': {'jitter': False, 'bright': False, 'hflip': False, 'vflip': False},
             # 'text': {'synset': False}
         },
@@ -96,8 +100,8 @@ def test_model(args, cfg):
         args_dict,
         train_dataset_name='NOCS',  # 占位，不用训练
         #val_dataset_name='TOYL'
-        val_dataset_name='NOCS'
-       #val_dataset_name='YCBV'
+        #val_dataset_name='NOCS'
+        val_dataset_name='YCBV'
         #val_dataset_name='LM'
     )
     datamodule.setup('test')
@@ -129,12 +133,17 @@ if __name__ == '__main__':
     setup_environment()
     ##
     #nocs:weights/lofter_Dicemask_shapenet_flip_lr/version_18/checkpoints/epoch=15-best_addval/add01d_acc=40.827.ckpt
-    #toyl:weights/lofter_Dicemask_shapenet_flip_lr1e-3_valTOYL/version_2/checkpoints/epoch=5-best_addval/add01d_acc=53.000.ckpt
+    #weights/lofter_Dicemask_shapenet_flip_lr/version_18/add01d_acc=39.768.ckpt
+    #weights/lofter_Dicemask_shapenet/version_0/checkpoints/epoch=18-best_addval/add01d_acc=37.150.ckpt
+    #toyl:weights/lofter_Dicemask_shapenet_flip_lr1e-3_valTOYL/version_2/checkpoints/epoch=5-best_addval/add01d_acc=53.000.ckpt  also for LM
+    #toyl add52.49:weights/lofter_Dicemask_shapenet_flip_lr1e-3_valTOYL/version_2/checkpoints/eepoch=7-every1.ckpt
+
+    # weights/lofter_Dicemask_shapenet_flip_lr1e-3_val_TOYL/version_6/checkpoints/epoch=7-best_addval/add01d_acc=47.127.ckpt
     #ycbv:weights/ycbv/version_0/checkpoints/epoch=3-best_addval/add01d_acc=0.200.ckpt
     #LM:weights/LM/version_2/checkpoints/epoch=15-best_addval/add01d_acc=9.775.ckpt
     # Parse arguments
     parser = argparse.ArgumentParser()
-    parser.add_argument('--checkpoint', default='weights/lofter_Dicemask_shapenet_flip_lr/version_18/checkpoints/epoch=15-best_addval/add01d_acc=40.827.ckpt')
+    parser.add_argument('--checkpoint', default='weights/ycbv/version_0/checkpoints/epoch=3-best_addval/add01d_acc=0.200.ckpt')
     parser.add_argument('--config', default='config/config.yaml')
     parser.add_argument('--dataset_root', default='filesOfOryon/data', help='Path to dataset root')
     args = parser.parse_args()
