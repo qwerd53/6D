@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+
+	<meta charset="UTF-8">
+	<title>Bridging Language and Geometry: Training-Free 6D Pose Estimation</title>
+
+	<link rel="stylesheet" type="text/css" href="layout.css">
+
+	<meta name="viewport" content="width=device-width, initial-scale=1.0">
+	<style>
+
+		h1 {
+			font-size: 200%;
+			text-align: center;
+		}
+
+		h2 {
+			font-size: 150%;
+			text-align: center;
+		}
+
+		h3 {
+			font-size: 100%;
+			text-align: center;
+		}
+
+		.center-justified {
+			text-align: justify;
+			margin: 0 auto;
+			width: 1000px;
+		}
+
+		.center {
+			text-align: center;
+		}
+
+	/* NAVIGATION */
+	nav {
+		width: 100%;
+		margin: 0 auto;
+		background: #fff;
+	}
+
+	/* By Dominik Biedebach @domobch */
+	nav ul {
+		list-style: none;
+		text-align: center;
+	}
+	nav ul li {
+		display: inline-block;
+	}
+	nav ul li a {
+		display: block;
+		padding: 0px;
+		text-decoration: none;
+		color: #aaa;
+		font-weight: 800;
+		margin: 0 10px;
+	}
+	nav ul li a,
+	nav ul li a:after,
+	nav ul li a:before {
+		transition: all .5s;
+	}
+	nav ul li a:hover {
+		color: #555;
+	}
+
+	/* stroke */
+	nav.stroke ul li a,
+	nav.fill ul li a {
+		position: relative;
+	}
+	nav.stroke ul li a:after,
+	nav.fill ul li a:after {
+		position: absolute;
+		bottom: 0;
+		left: 0;
+		right: 0;
+		margin: auto;
+		width: 0%;
+		content: '.';
+		color: transparent;
+		background: #333;
+		height: 1px;
+	}
+	nav.stroke ul li a:hover:after {
+		width: 100%;
+	}
+
+    .data-table {
+        border-collapse: collapse;
+    }
+    .border-top {
+        border-top: 1px solid #000;
+    }
+    .border-bottom {
+        border-bottom: 1px solid #000;
+    }
+    .border-left {
+        border-left: 1px solid #000;
+    }
+    .border-right {
+        border-right: 1px solid #000;
+    }
+</style>
+
+<script async src='/cdn-cgi/bm/cv/669835187/api.js'></script></head>
+
+<script type="text/javascript" src="http://cdn.mathjax.org/mathjax/latest/MathJax.js?config=AM_HTMLorMML-full"></script>
+
+<body>
+	<div class="center-justified" style="width:1000px;">
+		<h1>Bridging Language and Geometry: Training-Free 6D Pose Estimation via Language-Guided Geometric Priors</h1>
+		<h3>Long Tian, Dongyang Wang, Fengmao Lv, Tianrui Li</h3>
+		<h3>School of Computing and Artificial Intelligence, Southwest Jiaotong University, China</h3>
+		<h3>
+			<nav class="stroke">
+				<ul>
+					<li><a href="#abstract">Abstract</a></li>
+						<li><a href="#framework">Framework</a></li>
+						<li><a href="#results">Results</a></li>
+					<li><a href="#qualitative">Qualitative</a></li>
+					<li><a href="#Contacts">Contacts</a></li>
+				</ul>
+			</nav>
+		</h3>
+	</div>
+	<div class="center-justified">
+		<a name="abstract"></a>
+		<p>
+			<b>ABSTRACT:</b> 6D object pose estimation from visual observations is a fundamental yet challenging problem, especially in open-world scenarios where objects are specified on demand and may not have object-specific assets such as CAD models, pose annotations, or pre-built templates. Existing approaches are often limited by closed-set assumptions, requiring object-specific training or pre-collected priors, which restrict scalability to unseen objects. In this paper, we propose a training-free framework for 6D pose estimation that bridges language-guided perception and geometric reasoning. Our key idea is to reformulate pose estimation as a correspondence-driven problem conditioned on language-guided object localization. To this end, we introduce a language-guided mask prediction network, which leverages vision-language priors to localize target objects from natural-language descriptions. Importantly, these predicted masks act as inference-time geometric priors, constraining dense correspondence estimation, suppressing background clutter, and reducing matching ambiguity. The resulting correspondences are lifted to 3D space and solved via closed-form rigid alignment, enabling efficient and robust pose recovery without CAD models or pose-level supervision. Extensive experiments on multiple real-world benchmarks demonstrate strong generalization across diverse objects and scenes, consistently outperforming representative correspondence-based and language-guided baselines under realistic settings.
+		</p>
+
+		<br>
+		<br>
+
+
+	<a name="framework"></a>
+	<h2 style="text-align: left;">Framework</h2>
+	<div style="text-align: center;">
+		<img width="900" src="figures/overview_v4.2.png" style="display:block;margin:0 auto;" alt="Framework overview">
+		<p style="width:900px;margin:8px auto 0;text-align:left;color:#555;font-size:95%;">
+			<b>Figure 1:</b> Framework overview. Given an anchor RGB-D image, a query RGB-D image, and a text description of the target object, the method first predicts target object semantic segmentation masks M<sub>a</sub> and M<sub>q</sub>.
+			After that, a Transformer-based network performs coarse-to-fine dense matching, followed by hierarchical filtering based on mask constraints and confidence ranking.
+			Finally, the 2D correspondences are back-projected to 3D space using depth maps and camera intrinsics, and the relative 6D pose is computed via the Kabsch–Umeyama algorithm.
+		</p>
+	</div>
+	<p>
+		The method decouples semantics and geometry through an explicit intermediate representation (mask priors), which improves matching reliability under clutter, distractors, and viewpoint changes.
+		The localization network (<i>PromptMask</i>) is trained offline with mask supervision only; at inference time, correspondence estimation and pose recovery are entirely training-free, relying on pre-trained models and geometric solvers.
+	</p>
+
+
+		<br>
+		<br>
+
+	<a name="results"></a>
+	<h2 style="text-align: left;">Quantitative Results</h2>
+	<p>
+		We evaluate all methods under two mask settings: <b>GT</b> (ground-truth masks, upper bound) and <b>Pred</b> (predicted masks, realistic deployment). Metrics follow the BOP Benchmark: ADD(S)-0.1d and AR (average of VSD, MSSD, MSPD).
+	</p>
+	<div style="text-align: center;">
+		<!-- Table 1 placeholder: replace src with your exported table image -->
+		<img width="900" src="figures/table1.png" style="display:block;margin:0 auto;" alt="Table 1: Quantitative comparison">
+		<p style="width:900px;margin:8px auto 0;text-align:left;color:#555;font-size:95%;">
+			<b>Table 1:</b> Pose estimation performance with different mask types on NOCS, TOYL, and YCBV datasets.
+			GT mask results indicate an upper bound, while predicted masks are used in practice. Bold = best under Pred setting.
+		</p>
+	</div>
+
+	<p>
+		Under the realistic predicted-mask setting, our method consistently achieves the best overall performance across all datasets.
+		Averaged across all datasets, our method achieves ADD / AR / VSD / MSSD / MSPD of 44.7 / 32.5 / 19.9 / 38.8 / 38.6, compared to Oryon's 18.8 / 26.2 / 16.1 / 31.6 / 31.0.
+		A noticeable gap between GT-mask and Pred-mask results indicates that mask quality remains a key bottleneck, while also revealing the performance headroom of the geometric pipeline when object localization is accurate.
+	</p>
+
+
+		<br>
+		<br>
+
+	<a name="qualitative"></a>
+	<h2 style="text-align: left;">Qualitative Results</h2>
+
+	<div style="text-align: center;">
+		<img width="900" src="figures/boundingbox_v5.png" style="display:block;margin:0 auto;" alt="6D pose bounding box visualization">
+		<p style="width:900px;margin:8px auto 0;text-align:left;color:#555;font-size:95%;">
+			<b>Figure 2:</b> Qualitative comparison of 6D pose estimation.
+			For each example, the anchor image (left) and the query image (right) are shown. On the query image, the projected 3D bounding box under the ground-truth pose is rendered in green, while the bounding box under the predicted pose is rendered in red.
+		</p>
+	</div>
+
+	<br>
+
+	<div style="text-align: center;">
+		<img width="900" src="figures/mask_guided_matching_v4.png" style="display:block;margin:0 auto;" alt="Correspondence matching comparison">
+		<p style="width:900px;margin:8px auto 0;text-align:left;color:#555;font-size:95%;">
+			<b>Figure 3:</b> Three-way comparison of correspondence matching strategies.
+			Without mask guidance (top), many spurious matches arise from background regions. Using oracle ground-truth masks (middle) effectively suppresses background noise. Our predicted mask–guided matching (bottom) achieves comparable filtering quality.
+		</p>
+	</div>
+
+	<br>
+
+	<div style="text-align: center;">
+		<img width="900" src="figures/feature_tsne_comparison_fusion_v2.png" style="display:block;margin:0 auto;" alt="t-SNE feature visualization">
+		<p style="width:900px;margin:8px auto 0;text-align:left;color:#555;font-size:95%;">
+			<b>Figure 4:</b> t-SNE visualization of mask-guided feature distributions from anchor–query image pairs.
+			(a) No mask guidance: foreground and background features are highly entangled.
+			(b) GT mask-guided: oracle masks form compact foreground clusters.
+			(c) Predicted mask-guided (ours): learned masks produce foreground clusters comparable to the oracle case.
+		</p>
+	</div>
+
+	<br>
+
+	<div style="text-align: center;">
+		<img width="900" src="figures/registration2_v2.png" style="display:block;margin:0 auto;" alt="3D point cloud registration visualization">
+		<p style="width:900px;margin:8px auto 0;text-align:left;color:#555;font-size:95%;">
+			<b>Figure 5:</b> Visualization of 2D-3D point cloud registration and alignment.
+			(a) Source point cloud P<sub>S</sub> (red) back-projected from 2D coordinates is initially misaligned with target P<sub>T</sub> (green).
+			(b) After applying the predicted rotation R and translation t via SVD, the aligned source cloud shows dominantly low error (blue), demonstrating high pose accuracy.
+		</p>
+	</div>
+
+		<br>
+		<br>
+
+	<a name="Contacts"></a>
+	<h2 style="text-align: left;">Contacts</h2>
+	<p>
+		If you have any further enquiries, question, or comments, please contact <a href="mailto:long.tian@swjtu.edu.cn"><u>long.tian@swjtu.edu.cn</u></a>
+	</p>
+
+		</div>
+	<br>
+	<br>
+<script type="text/javascript">(function(){window['__CF$cv$params']={r:'6de861896b0275cb',m:'ppqRX6tRQH4fUS12qEp4ASn7HTYLZcxczg_G238ujv8-1645031338-0-ASgYPROdw9+o4jFoUNr8Id49tDTtlx5gflbKrAkhfXy2ENQyKulR5gLqJ0Bkdz59YBZm/firsQF0/kj1XO5yyxa5ap7YlCONhhMEOMs9TeGlQzoXAMk4nHBNsniUUaUcRTdaSZhpPQGOa6qn4k9yqil4uoTx4WWfMhmspNBlh1UhCVyy0G3RKeZWSAkf/VI9eQ==',s:[0x1f8bab9e4e,0x98dc696c79],}})();</script></body> 
+</html>

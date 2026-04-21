@@ -1,0 +1,1 @@
+# Bridging Language and Geometry: Training-Free 6D Pose Estimation via Language-Guided Geometric Priors
