@@ -3,6 +3,7 @@ __pycache__/
 *.pth
 *.pt
 *.ckpt
+README.md
 runs/
 logs/
 wandb/
