@@ -4,6 +4,7 @@ __pycache__/
 *.pt
 *.ckpt
 README.md
+.gitignore
 runs/
 logs/
 wandb/
